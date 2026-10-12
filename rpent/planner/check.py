@@ -117,8 +117,7 @@ _KEYCHAIN_SERVICES = {"claude_code": "Claude Code-credentials"}
 #: The smallest prompt that still proves the model answered.
 PROBE_PROMPT = "Reply with the single word: ok"
 
-#: Completion budget for the probe, including reasoning tokens that some
-#: providers consume before producing the final reply.
+#: Output cap for the probe. Large enough for a word, small enough to be free.
 PROBE_MAX_TOKENS = 2048
 
 #: Advisory only: names the env var in an error before pydantic-ai is asked to
