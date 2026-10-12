@@ -15,14 +15,18 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
+from openai import AsyncOpenAI
 from pydantic_ai.exceptions import ModelHTTPError, UserError
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
 
 from rpent.planner import check as check_mod
 from rpent.planner.check import (
@@ -226,6 +230,75 @@ def test_api_success_reports_reply_and_latency(
     assert result.reply == "ok"
     assert result.latency_s is not None and result.latency_s >= 0
     assert result.credential_present is True
+
+
+@pytest.mark.parametrize(
+    ("reasoning_tokens", "return_text"), [(0, True), (64, True), (64, False)]
+)
+def test_api_probe_requires_a_final_reply_after_reasoning(
+    monkeypatch: pytest.MonkeyPatch, reasoning_tokens: int, return_text: bool
+) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", SENTINEL_KEY)
+    requests: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        budget = body["max_completion_tokens"]
+        truncated = not return_text or budget <= reasoning_tokens
+        consumed_reasoning = budget if truncated else reasoning_tokens
+        completion_tokens = consumed_reasoning + (0 if truncated else 1)
+        return httpx.Response(
+            200,
+            json={
+                "id": "probe-response",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "deepseek-v4.1-flash",
+                "choices": [
+                    {
+                        "index": 0,
+                        "finish_reason": "length" if truncated else "stop",
+                        "message": {
+                            "role": "assistant",
+                            "content": "" if truncated else "ok",
+                            "reasoning_content": "I should reply with ok."
+                            if reasoning_tokens
+                            else "",
+                        },
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 37,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": 37 + completion_tokens,
+                    "completion_tokens_details": {
+                        "reasoning_tokens": consumed_reasoning,
+                    },
+                },
+            },
+        )
+
+    async def probe() -> Any:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+            client = AsyncOpenAI(api_key=SENTINEL_KEY, http_client=http)
+            model = OpenAIChatModel(
+                "deepseek-v4.1-flash", provider=OpenAIProvider(openai_client=client)
+            )
+            _patch_model(monkeypatch, model)
+            return await asyncio.to_thread(
+                check_llm,
+                LlmCheckRequest(planner="api", model="openai-chat:deepseek-v4.1-flash"),
+            )
+
+    result = asyncio.run(probe())
+
+    assert result.ok is return_text, result.detail
+    assert result.status == (STATUS_OK if return_text else STATUS_SDK_ERROR)
+    assert result.reply == ("ok" if return_text else "")
+    assert len(requests) == 1
+    assert requests[0]["messages"] == [{"role": "user", "content": PROBE_PROMPT}]
+    assert not requests[0].get("tools")
 
 
 def test_api_empty_reply_is_a_provider_error_not_a_success(
