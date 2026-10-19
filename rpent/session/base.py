@@ -23,12 +23,23 @@ import threading
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+from uuid import uuid4
 
 import imageio.v2 as imageio
 import numpy as np
 
+from rpent.session.records import (
+    ActionRecord,
+    MissingInfo,
+    ObservationRecord,
+    Payload,
+    PlannerRecord,
+    TaskRecord,
+    ToolCallRecord,
+)
 from rpent.utils.logging import get_logger
 
 logger = get_logger("env_state")
@@ -94,11 +105,18 @@ class StepRecord:
 
 
 class EnvState:
-    """Own a session's step trace and all state-related files in its output root."""
+    """Own task records in memory, legacy tool steps, and stored artifacts."""
 
     def __init__(self, output_dir: Path | str):
         self._output_dir = Path(output_dir)
         self._artifact_lock = threading.Lock()
+        self._records_lock = threading.Lock()
+        self._task: TaskRecord | None = None
+        self._planners: dict[str, PlannerRecord] = {}
+        self._tool_calls: dict[str, ToolCallRecord] = {}
+        self._observations: dict[str, ObservationRecord] = {}
+        self._actions: dict[str, ActionRecord] = {}
+        self._id_counters = dict.fromkeys(("P", "T", "O", "A"), 0)
         self.reset()
 
     # -- private file resolution -----------------------------------------
@@ -153,10 +171,251 @@ class EnvState:
         finally:
             temporary.unlink(missing_ok=True)
 
-    # -- lifecycle and counters -----------------------------------------
+    # -- task lifecycle -------------------------------------------------
+
+    def start_task(self, *, instruction: str, config: Payload) -> str:
+        """Start this store's single task and return its ID."""
+        with self._records_lock:
+            if self._task is not None:
+                raise RuntimeError("a task has already been started")
+            self._task = TaskRecord(
+                task_id=uuid4().hex,
+                instruction=instruction,
+                config=copy.deepcopy(config),
+                status="running",
+                started_at=datetime.now(timezone.utc),
+            )
+            return self._task.task_id
+
+    def end_task(
+        self,
+        *,
+        status: Literal["completed", "failed", "cancelled"],
+        stop_reason: str,
+        result: Payload | None = None,
+    ) -> None:
+        """Record task completion after all execution and capture have settled."""
+        if status not in {"completed", "failed", "cancelled"}:
+            raise ValueError(f"invalid task end status: {status!r}")
+        with self._records_lock:
+            task = self._running_task()
+            result = copy.deepcopy(result)
+            task.status = status
+            task.stop_reason = stop_reason
+            task.result = result
+            task.ended_at = datetime.now(timezone.utc)
+
+    def get_task(self) -> TaskRecord | None:
+        """Return a task snapshot, or None before start_task()."""
+        with self._records_lock:
+            return copy.deepcopy(self._task)
+
+    def _running_task(self) -> TaskRecord:
+        if self._task is None or self._task.status != "running":
+            raise RuntimeError("task is not running")
+        return self._task
+
+    def _new_record_id(self, kind: Literal["P", "T", "O", "A"]) -> str:
+        """Allocate an ID while holding the records lock."""
+        self._id_counters[kind] += 1
+        return f"{kind}{self._id_counters[kind]}"
+
+    # -- task record registration ---------------------------------------
+
+    def register_planner(
+        self,
+        *,
+        backend: str,
+        status: Literal["open", "completed", "failed", "cancelled"] = "open",
+        request: Payload | None = None,
+        response: Payload | None = None,
+        source_ids: dict[str, str] | None = None,
+        started_at: datetime | None = None,
+        ended_at: datetime | None = None,
+        missing: dict[str, MissingInfo] | None = None,
+    ) -> str:
+        """Register one model call; tool calls are registered separately."""
+        with self._records_lock:
+            self._running_task()
+            record = copy.deepcopy(
+                PlannerRecord(
+                    planner_id=self._new_record_id("P"),
+                    backend=backend,
+                    status=status,
+                    request=request,
+                    response=response,
+                    source_ids=source_ids or {},
+                    started_at=started_at,
+                    ended_at=ended_at,
+                    missing=missing or {},
+                )
+            )
+            self._planners[record.planner_id] = record
+            return record.planner_id
+
+    def register_tool_call(
+        self,
+        *,
+        planner_id: str,
+        name: str,
+        arguments: Payload,
+        status: Literal[
+            "requested",
+            "running",
+            "completed",
+            "failed",
+            "cancelled",
+            "not_executed",
+            "unknown",
+        ] = "requested",
+        source_ids: dict[str, str] | None = None,
+        effective_instruction: str | None = None,
+        model_config: Payload | None = None,
+        started_at: datetime | None = None,
+        ended_at: datetime | None = None,
+        raw_result: Payload | None = None,
+        feedback: Payload | None = None,
+        before_observation_id: str | None = None,
+        after_observation_id: str | None = None,
+        missing: dict[str, MissingInfo] | None = None,
+    ) -> str:
+        """Register a model-issued tool call in response order and index it."""
+        with self._records_lock:
+            self._running_task()
+            planner = self._planners[planner_id]
+            record = copy.deepcopy(
+                ToolCallRecord(
+                    tool_call_id=self._new_record_id("T"),
+                    planner_id=planner_id,
+                    origin="model",
+                    name=name,
+                    arguments=arguments,
+                    status=status,
+                    source_ids=source_ids or {},
+                    effective_instruction=effective_instruction,
+                    model_config=model_config,
+                    started_at=started_at,
+                    ended_at=ended_at,
+                    raw_result=raw_result,
+                    feedback=feedback,
+                    before_observation_id=before_observation_id,
+                    after_observation_id=after_observation_id,
+                    missing=missing or {},
+                )
+            )
+            planner.tool_calls.append(record)
+            self._tool_calls[record.tool_call_id] = record
+            return record.tool_call_id
+
+    def register_observation(
+        self,
+        *,
+        control_step: int | None,
+        capture_sequence: int,
+        payload: Payload,
+        captured_at: datetime | None = None,
+        missing: dict[str, MissingInfo] | None = None,
+    ) -> str:
+        """Register a new capture; reuse its returned ID to share that capture."""
+        with self._records_lock:
+            self._running_task()
+            record = copy.deepcopy(
+                ObservationRecord(
+                    observation_id=self._new_record_id("O"),
+                    control_step=control_step,
+                    capture_sequence=capture_sequence,
+                    payload=payload,
+                    captured_at=captured_at,
+                    missing=missing or {},
+                )
+            )
+            self._observations[record.observation_id] = record
+            return record.observation_id
+
+    def register_action(
+        self,
+        *,
+        tool_call_id: str,
+        source: Literal["vla", "tool_computed", "direct"],
+        action_format_id: str,
+        control_step: int | None,
+        action: Payload,
+        before_observation_id: str | None,
+        after_observation_id: str | None,
+        executed_at: datetime | None = None,
+        result: Payload | None = None,
+        missing: dict[str, MissingInfo] | None = None,
+    ) -> str:
+        """Register a confirmed action, retaining missing observation boundaries."""
+        with self._records_lock:
+            self._running_task()
+            if tool_call_id not in self._tool_calls:
+                raise KeyError(tool_call_id)
+            record = copy.deepcopy(
+                ActionRecord(
+                    action_id=self._new_record_id("A"),
+                    tool_call_id=tool_call_id,
+                    source=source,
+                    action_format_id=action_format_id,
+                    control_step=control_step,
+                    action=action,
+                    before_observation_id=before_observation_id,
+                    after_observation_id=after_observation_id,
+                    executed_at=executed_at,
+                    result=result,
+                    missing=missing or {},
+                )
+            )
+            self._actions[record.action_id] = record
+            return record.action_id
+
+    # -- task record snapshots ------------------------------------------
+
+    def get_planner(self, planner_id: str) -> PlannerRecord:
+        """Return a model call and its tool calls as a snapshot."""
+        with self._records_lock:
+            return copy.deepcopy(self._planners[planner_id])
+
+    def get_tool_call(self, tool_call_id: str) -> ToolCallRecord:
+        """Return a tool call snapshot by ID."""
+        with self._records_lock:
+            return copy.deepcopy(self._tool_calls[tool_call_id])
+
+    def get_observation(self, observation_id: str) -> ObservationRecord:
+        """Return an observation snapshot by ID."""
+        with self._records_lock:
+            return copy.deepcopy(self._observations[observation_id])
+
+    def get_action(self, action_id: str) -> ActionRecord:
+        """Return an executed action snapshot by ID."""
+        with self._records_lock:
+            return copy.deepcopy(self._actions[action_id])
+
+    def planner_records(self) -> list[PlannerRecord]:
+        """Return model call snapshots in registration order."""
+        with self._records_lock:
+            return copy.deepcopy(list(self._planners.values()))
+
+    def action_records(self) -> list[ActionRecord]:
+        """Return actions by control step, followed by unpositioned actions.
+
+        Unpositioned actions retain registration order, not an inferred execution order.
+        """
+        with self._records_lock:
+            return copy.deepcopy(
+                sorted(
+                    self._actions.values(),
+                    key=lambda record: (
+                        record.control_step is None,
+                        record.control_step if record.control_step is not None else 0,
+                    ),
+                )
+            )
+
+    # -- legacy lifecycle and counters ----------------------------------
 
     def reset(self) -> None:
-        """Reset the in-memory trace without removing on-disk artifacts."""
+        """Clear legacy tool state, preserving task records and disk artifacts."""
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._steps: list[StepRecord] = []
         self._run_artifacts: set[str] = set()
