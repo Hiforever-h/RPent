@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -182,9 +183,11 @@ def test_dashboard_exploration_finalizes_memory_and_reports_merge_failures(
     sessions: int,
 ) -> None:
     from rpent.cli import dashboard as dashboard_cli
+    from rpent.session import EnvState
 
     merge_calls: list[dict[str, Any]] = []
     solved_calls = []
+    stores = []
 
     class FakeMemoryManager:
         def merge_memory(self, **kwargs: Any) -> dict[str, int]:
@@ -195,6 +198,10 @@ def test_dashboard_exploration_finalizes_memory_and_reports_merge_failures(
 
     class FakeToolkit:
         memory = FakeMemoryManager()
+
+        def __init__(self):
+            self.state = EnvState(tmp_path / f"state-{len(stores)}")
+            stores.append(self.state)
 
         def cancel_active_and_wait(self) -> None:
             pass
@@ -207,7 +214,7 @@ def test_dashboard_exploration_finalizes_memory_and_reports_merge_failures(
             return str(tmp_path / f"{recipe_tag}_recipe.jsonl")
 
         def close(self) -> None:
-            pass
+            assert self.state.get_task().status == "running"
 
     class FakeState:
         task_replacement_requested = False
@@ -304,6 +311,16 @@ def test_dashboard_exploration_finalizes_memory_and_reports_merge_failures(
 
     assert error is None
     assert state.toolkit_lifecycle == ["bound", "unbound"] * sessions
+    assert len(stores) == sessions
+    assert all(store.get_task().status == "completed" for store in stores)
+    saved_tasks = [
+        json.loads(path.read_text())["task"]
+        for path in tmp_path.glob("**/trajectories/*/task.json")
+    ]
+    assert {task["task_id"] for task in saved_tasks} == {
+        store.get_task().task_id for store in stores
+    }
+    assert all(task["status"] == "completed" for task in saved_tasks)
     assert merge_calls == [
         {
             "cell_tag": "libero_s0",

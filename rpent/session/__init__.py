@@ -16,8 +16,6 @@
 
 from rpent.session.base import EnvState, StepRecord
 from rpent.session.records import (
-    ActionField,
-    ActionFormat,
     ActionRecord,
     ArtifactRef,
     DataRef,
@@ -31,8 +29,6 @@ from rpent.session.records import (
 )
 
 __all__ = [
-    "ActionField",
-    "ActionFormat",
     "ActionRecord",
     "ArtifactRef",
     "DataRef",

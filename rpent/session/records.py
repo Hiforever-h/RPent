@@ -150,8 +150,6 @@ class ObservationRecord:
     """One collection of native environment data, shared by observation ID."""
 
     observation_id: str
-    control_step: int | None  # Executed control actions at capture time.
-    capture_sequence: int  # Acquisition order within the task.
     payload: Payload
     captured_at: datetime | None = None
     missing: dict[str, MissingInfo] = field(default_factory=dict)
@@ -159,45 +157,17 @@ class ObservationRecord:
 
 @dataclass
 class ActionRecord:
-    """One confirmed control action with its final native value and result."""
+    """One confirmed control action with its final native value and result.
+
+    ``action.format`` identifies the native protocol, interpreted with task config.
+    """
 
     action_id: str
     tool_call_id: str
     source: Literal["vla", "tool_computed", "direct"]
-    action_format_id: str
-    control_step: int | None  # Executed control actions before this action.
     action: Payload
     before_observation_id: str | None
     after_observation_id: str | None
     executed_at: datetime | None = None
     result: Payload | None = None
-    missing: dict[str, MissingInfo] = field(default_factory=dict)
-
-
-@dataclass
-class ActionField:
-    """Layout and control semantics of one native action component."""
-
-    name: str
-    path: str  # JSON Pointer into action data; empty for the root.
-    index_range: tuple[int, int] | None = None  # Half-open flat-array slice.
-    shape: tuple[int, ...] | None = None
-    dtype: str | None = None
-    control_mode: str | None = None
-    coordinate_frame: str | None = None
-    unit: str | None = None
-    description: str | None = None
-    missing: dict[str, MissingInfo] = field(default_factory=dict)
-
-
-@dataclass
-class ActionFormat:
-    """Reusable native action layout with ordered fields and environment specs."""
-
-    action_format_id: str
-    representation: Literal["array", "dict"]
-    fields: list[ActionField] = field(default_factory=list)
-    control_period_s: float | None = None
-    description: str | None = None
-    native_spec: Payload | None = None
     missing: dict[str, MissingInfo] = field(default_factory=dict)

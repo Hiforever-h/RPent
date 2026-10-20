@@ -483,10 +483,12 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
     cli = _cli_module()
     from rpent.planner.base import PlannerResult
     from rpent.robots import PromptBundle, RobotSpec, RunConfig
+    from rpent.session import EnvState
     from rpent.tools import common
     from rpent.tools.toolkit import ToolResult
 
     calls: dict[str, Any] = {}
+    stores = []
     model_requests = 0
 
     class FakeMemoryManager:
@@ -645,6 +647,8 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
 
     def get_toolkit(*args: Any, **kwargs: Any) -> FakeToolkit:
         calls["get_toolkit"] = (args, kwargs)
+        toolkit.state = EnvState(kwargs["state_output_dir"])
+        stores.append(toolkit.state)
         return toolkit
 
     def reject_memory_sync(*args: Any, **kwargs: Any) -> None:
@@ -687,6 +691,23 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
 
     assert cli.main() == 0
     assert calls["build_planner"][1]["interactive"] is interactive
+    assert all(store.get_task().ended_at is not None for store in stores)
+    assert len({store.get_task().task_id for store in stores}) == len(stores)
+    saved_tasks = {
+        data["task_id"]: data
+        for path in tmp_path.glob("**/trajectories/*/task.json")
+        for data in [json.loads(path.read_text())["task"]]
+    }
+    assert len(saved_tasks) == len(stores)
+    for store in stores:
+        task = store.get_task()
+        assert saved_tasks[task.task_id]["status"] == task.status
+    if outcome == "response_truncated":
+        assert [store.get_task().status for store in stores] == ["failed", "completed"]
+    else:
+        assert all(store.get_task().status == "completed" for store in stores)
+    if outcome == "request_budget":
+        assert all(store.get_task().stop_reason == "request_limit" for store in stores)
     assert toolkit.closed is True
     assert daemon.stopped is True
     assert calls["get_toolkit"][1]["runtime_kwargs"] == {"runtime": "simulated"}
@@ -742,7 +763,7 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
     ]
 
 
-@pytest.mark.parametrize("planner_name", ["codex", "flash"])
+@pytest.mark.parametrize("planner_name", ["api", "codex", "flash"])
 @pytest.mark.parametrize(
     "planner_error", [None, "RuntimeError: Grasp not held; replay stopped"]
 )
@@ -756,6 +777,7 @@ def test_full_cli_calls_robot_result_finalizer_without_robot_special_case(
     from rpent.evaluation import RunFinalizationContext, write_json_atomic
     from rpent.planner.base import PlannerResult
     from rpent.robots import PromptBundle, RobotSpec, RunConfig
+    from rpent.session import EnvState
 
     captured: list[RunFinalizationContext] = []
 
@@ -768,6 +790,7 @@ def test_full_cli_calls_robot_result_finalizer_without_robot_special_case(
     class FakeToolkit:
         memory = SimpleNamespace()
         closed = False
+        state = EnvState(tmp_path / "state")
 
         def solved(self) -> bool:
             return False
@@ -801,6 +824,13 @@ def test_full_cli_calls_robot_result_finalizer_without_robot_special_case(
     def finalize_run(context: RunFinalizationContext) -> Path:
         captured.append(context)
         assert robot_toolkit.closed is True
+        if planner_name == "api":
+            task = robot_toolkit.state.get_task()
+            assert task.status == ("failed" if planner_error else "completed")
+            assert task.result.data["environment_success"] is False
+            assert task.instruction == "task\n"
+        else:
+            assert robot_toolkit.state.get_task() is None
         return write_json_atomic(
             context.output_dir / "result.json",
             {

@@ -14,13 +14,17 @@
 
 """Task ownership, record identity, and independent model/action trajectories."""
 
+import json
+import os
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from rpent.session import DataRef, EnvState, MissingInfo, Payload
+from rpent.session import ArtifactRef, DataRef, EnvState, MissingInfo, Payload
 
 
 @pytest.fixture
@@ -51,16 +55,18 @@ def tool_id(state: EnvState) -> str:
     ],
 )
 def test_task_end_preserves_collected_data_and_independent_call_statuses(
-    state: EnvState, tool_id: str, status: str, reason: str, result: dict | None
+    state: EnvState,
+    tool_id: str,
+    status: str,
+    reason: str,
+    result: dict | None,
 ) -> None:
     observation_id = state.register_observation(
-        control_step=0, capture_sequence=0, payload=Payload("test.observation", [0.0])
+        payload=Payload("test.observation", [0.0])
     )
     action_id = state.register_action(
         tool_call_id=tool_id,
         source="vla",
-        action_format_id="joint",
-        control_step=0,
         action=Payload("test.action", np.array([0.5], dtype=np.float32)),
         before_observation_id=observation_id,
         after_observation_id=None,
@@ -82,6 +88,7 @@ def test_task_end_preserves_collected_data_and_independent_call_statuses(
     assert state.get_tool_call(tool_id).status == "requested"
     assert state.planner_records()[0].status == "completed"
     action = state.get_action(action_id)
+    assert action.action.format == "test.action"
     assert action.before_observation_id == observation_id
     assert action.after_observation_id is None
     assert action.missing["after_observation_id"].reason == "capture_failed"
@@ -99,6 +106,18 @@ def test_task_is_explicit_and_cannot_be_overwritten(tmp_path: Path) -> None:
     assert state.get_task() is None
     with pytest.raises(RuntimeError, match="not running"):
         state.register_planner(backend="api")
+    with pytest.raises(RuntimeError, match="not running"):
+        state.update_planner("P1", status="failed")
+    with pytest.raises(RuntimeError, match="not running"):
+        state.update_tool_call("T1", status="not_executed")
+    with pytest.raises(RuntimeError, match="not running"):
+        state.register_action(
+            tool_call_id="T1",
+            source="direct",
+            action=Payload("test.action", [0.5]),
+            before_observation_id=None,
+            after_observation_id=None,
+        )
     with pytest.raises(RuntimeError, match="not running"):
         state.end_task(status="completed", stop_reason="finish")
 
@@ -123,34 +142,330 @@ def test_task_is_explicit_and_cannot_be_overwritten(tmp_path: Path) -> None:
     assert other.start_task(instruction="Move.", config=Payload("json", {})) != task_id
 
 
-def test_ended_task_rejects_new_records(state: EnvState, tool_id: str) -> None:
+def test_ended_task_rejects_record_writes(state: EnvState, tool_id: str) -> None:
     planner_id = state.get_tool_call(tool_id).planner_id
+    planners = state.planner_records()
     state.end_task(status="cancelled", stop_reason="operator")
 
-    registrations = [
+    writes = [
         lambda: state.register_planner(backend="api"),
+        lambda: state.update_planner(planner_id, status="cancelled"),
+        lambda: state.update_tool_call(tool_id, status="cancelled"),
         lambda: state.register_tool_call(
             planner_id=planner_id, name="move", arguments=Payload("json", {})
         ),
-        lambda: state.register_observation(
-            control_step=0, capture_sequence=0, payload=Payload("json", {})
-        ),
+        lambda: state.register_observation(payload=Payload("json", {})),
         lambda: state.register_action(
             tool_call_id=tool_id,
             source="direct",
-            action_format_id="joint",
-            control_step=0,
-            action=Payload("json", [0.5]),
+            action=Payload("test.action", [0.5]),
             before_observation_id=None,
             after_observation_id=None,
         ),
     ]
-    for register in registrations:
+    for write in writes:
         with pytest.raises(RuntimeError, match="not running"):
-            register()
-    assert len(state.planner_records()) == 1
-    assert len(state.get_planner(planner_id).tool_calls) == 1
+            write()
+    assert state.planner_records() == planners
     assert state.action_records() == []
+
+
+def test_planner_update_preserves_request_tools_and_registration_order(
+    state: EnvState,
+) -> None:
+    started = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    ended = started + timedelta(seconds=2)
+    request = Payload("test.request", {"messages": ["Move."]})
+    planner_id = state.register_planner(
+        backend="api",
+        request=request,
+        started_at=started,
+        source_ids={"pydantic_ai.run_id": "run_1"},
+        missing={
+            "response": MissingInfo("pending", "Waiting for the model."),
+            "/source_ids/provider.request_id": MissingInfo(
+                "not_exposed", "No provider request ID."
+            ),
+        },
+    )
+    next_planner = state.register_planner(backend="api")
+    tool_id = state.register_tool_call(
+        planner_id=planner_id, name="move", arguments=Payload("json", {})
+    )
+    before = state.get_planner(planner_id)
+    response = Payload("test.response", {"tool_calls": ["move"]})
+
+    state.update_planner(
+        planner_id,
+        status="completed",
+        response=response,
+        source_ids={"provider.response_id": "response_1"},
+        ended_at=ended,
+    )
+    assert state.get_planner(planner_id).missing == before.missing
+    state.update_planner(planner_id, missing={"response": None, "ended_at": None})
+    state.update_planner(planner_id, status=None, response=None, ended_at=None)
+
+    after = state.get_planner(planner_id)
+    assert after.planner_id == before.planner_id
+    assert after.backend == "api" and after.request == request
+    assert after.started_at == started and after.ended_at == ended
+    assert after.status == "completed" and after.response == response
+    assert after.tool_calls == before.tool_calls == [state.get_tool_call(tool_id)]
+    assert after.source_ids == {
+        "pydantic_ai.run_id": "run_1",
+        "provider.response_id": "response_1",
+    }
+    assert after.missing == {
+        "/source_ids/provider.request_id": before.missing[
+            "/source_ids/provider.request_id"
+        ]
+    }
+    assert before.status == "open" and before.response is None
+    assert before.ended_at is None
+    assert [record.planner_id for record in state.planner_records()] == [
+        planner_id,
+        next_planner,
+    ]
+    assert state.register_planner(backend="api") == "P3"
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
+def test_tool_update_keeps_action_links_and_accepts_late_feedback(
+    state: EnvState, tool_id: str, status: str
+) -> None:
+    before = state.get_tool_call(tool_id)
+    planner_id = before.planner_id
+    sibling_id = state.register_tool_call(
+        planner_id=planner_id, name="observe", arguments=Payload("json", {})
+    )
+    observations = [
+        state.register_observation(payload=Payload("test.obs", [value]))
+        for value in [0, 1]
+    ]
+    started = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    ended = started + timedelta(seconds=3)
+    config = Payload("test.config", {"model": "vla"})
+    state.update_tool_call(
+        tool_id,
+        status="running",
+        effective_instruction="Move the cup.",
+        model_config=config,
+        started_at=started,
+        before_observation_id=observations[0],
+    )
+    action_id = state.register_action(
+        tool_call_id=tool_id,
+        source="vla",
+        action=Payload("test.action", [0.5]),
+        before_observation_id=observations[0],
+        after_observation_id=observations[1],
+    )
+    state.update_tool_call(
+        tool_id,
+        status=status,
+        raw_result=Payload("test.result", {"executed_steps": 1}),
+        after_observation_id=observations[1],
+        ended_at=ended,
+        missing={"feedback": MissingInfo("pending", "Waiting for the adapter.")},
+    )
+    finished = state.get_tool_call(tool_id)
+    feedback = Payload("test.feedback", DataRef("tool_call", tool_id, "/raw_result"))
+    state.update_tool_call(tool_id, feedback=feedback, missing={"feedback": None})
+    state.update_tool_call(
+        tool_id,
+        status=None,
+        model_config=None,
+        raw_result=None,
+        feedback=None,
+        before_observation_id=None,
+        after_observation_id=None,
+    )
+
+    after = state.get_tool_call(tool_id)
+    assert after.tool_call_id == before.tool_call_id
+    assert after.planner_id == planner_id and after.origin == before.origin
+    assert after.name == before.name and after.arguments == before.arguments
+    assert after.status == status and after.effective_instruction == "Move the cup."
+    assert after.model_config == config
+    assert after.started_at == started and after.ended_at == ended
+    assert after.before_observation_id == observations[0]
+    assert after.after_observation_id == observations[1]
+    assert after.raw_result == finished.raw_result
+    assert after.feedback == feedback and after.missing == {}
+    assert finished.feedback is None and "feedback" in finished.missing
+    assert before.status == "requested" and before.started_at is None
+    assert state.get_action(action_id).tool_call_id == tool_id
+    planner = state.get_planner(planner_id)
+    assert planner.status == "completed"
+    assert planner.tool_calls == [after, state.get_tool_call(sibling_id)]
+    assert state.planner_records()[0].tool_calls == planner.tool_calls
+    assert (
+        state.register_tool_call(
+            planner_id=planner_id, name="finish", arguments=Payload("json", {})
+        )
+        == "T3"
+    )
+
+
+def test_updates_record_failures_without_inventing_results_or_times(
+    state: EnvState, tool_id: str
+) -> None:
+    planner_id = state.register_planner(backend="api")
+    state.update_planner(
+        planner_id,
+        status="failed",
+        missing={"response": MissingInfo("capture_failed", "Connection closed.")},
+    )
+    state.update_tool_call(tool_id, status="not_executed")
+
+    planner = state.get_planner(planner_id)
+    tool = state.get_tool_call(tool_id)
+    assert planner.status == "failed" and planner.response is None
+    assert planner.started_at is None and planner.ended_at is None
+    assert planner.missing["response"].reason == "capture_failed"
+    assert tool.status == "not_executed" and tool.raw_result is None
+    assert tool.started_at is None and tool.ended_at is None
+    assert state.action_records() == []
+
+
+def test_updates_isolate_nested_payloads_metadata_and_query_snapshots(
+    state: EnvState, tool_id: str
+) -> None:
+    planner_id = state.register_planner(backend="api")
+    values = np.array([1.0, 2.0], dtype=np.float32)
+    payload = Payload("test.data", {"values": values, "content": [b"image"]})
+    source_ids = {"test.id": "original"}
+    missing = {"ended_at": MissingInfo("pending", "Waiting for completion.")}
+    state.update_planner(
+        planner_id, response=payload, source_ids=source_ids, missing=missing
+    )
+    state.update_tool_call(
+        tool_id,
+        model_config=payload,
+        raw_result=payload,
+        feedback=payload,
+        source_ids=source_ids,
+        missing=missing,
+    )
+    values[:] = 99
+    payload.data["content"].clear()
+    source_ids.clear()
+    missing["ended_at"].detail = "Changed"
+    missing.clear()
+    planner = state.get_planner(planner_id)
+    tool = state.get_tool_call(tool_id)
+    planner.response.data["values"][:] = 88
+    planner.source_ids.clear()
+    planner.missing["ended_at"].detail = "Changed again"
+    tool.model_config.data["content"].clear()
+    tool.raw_result.data["values"][:] = 77
+    tool.feedback.data.clear()
+    tool.source_ids.clear()
+    tool.missing.clear()
+    state.planner_records()[0].tool_calls[0].raw_result.data.clear()
+
+    planner = state.get_planner(planner_id)
+    tool = state.get_tool_call(tool_id)
+    for captured in [
+        planner.response,
+        tool.model_config,
+        tool.raw_result,
+        tool.feedback,
+    ]:
+        np.testing.assert_array_equal(captured.data["values"], [1.0, 2.0])
+        assert captured.data["content"] == [b"image"]
+    for record in [planner, tool]:
+        assert record.source_ids == {"test.id": "original"}
+        assert record.missing == {
+            "ended_at": MissingInfo("pending", "Waiting for completion.")
+        }
+
+
+@pytest.mark.parametrize(
+    "kind,field",
+    [
+        ("planner", "response"),
+        ("tool_call", "model_config"),
+        ("tool_call", "raw_result"),
+        ("tool_call", "feedback"),
+    ],
+)
+@pytest.mark.parametrize("capture_at_registration", [False, True])
+def test_captured_payloads_cannot_be_overwritten_even_when_null(
+    state: EnvState, kind: str, field: str, capture_at_registration: bool
+) -> None:
+    captured = {field: Payload("test.null", None)}
+    initial = captured if capture_at_registration else {}
+    if kind == "planner":
+        record_id = state.register_planner(backend="api", **initial)
+    else:
+        planner_id = state.register_planner(backend="api")
+        record_id = state.register_tool_call(
+            planner_id=planner_id, name="move", arguments=Payload("json", {}), **initial
+        )
+    update = getattr(state, f"update_{kind}")
+    get = getattr(state, f"get_{kind}")
+    if not capture_at_registration:
+        update(record_id, **captured)
+    before = state.planner_records()
+    assert getattr(get(record_id), field) == captured[field]
+
+    with pytest.raises(ValueError, match=f"{field} has already been captured"):
+        update(
+            record_id,
+            status="failed",
+            source_ids={"test.id": "changed"},
+            missing={"ended_at": MissingInfo("not_recorded", "No timestamp.")},
+            **{field: Payload("test.result", {"changed": True})},
+        )
+
+    assert state.planner_records() == before
+
+
+@pytest.mark.parametrize(
+    "kind,invalid_status", [("planner", "running"), ("tool_call", "open")]
+)
+def test_invalid_update_status_leaves_record_unchanged(
+    state: EnvState, tool_id: str, kind: str, invalid_status: str
+) -> None:
+    record_id = (
+        tool_id if kind == "tool_call" else state.get_tool_call(tool_id).planner_id
+    )
+    before = state.planner_records()
+    with pytest.raises(ValueError, match="invalid .* status"):
+        getattr(state, f"update_{kind}")(
+            record_id,
+            status=invalid_status,
+            source_ids={"test.id": "changed"},
+            missing={"ended_at": MissingInfo("not_recorded", "No timestamp.")},
+        )
+    assert state.planner_records() == before
+
+
+@pytest.mark.parametrize(
+    "kind,field", [("planner", "response"), ("tool_call", "feedback")]
+)
+def test_failed_update_copy_leaves_record_unchanged(
+    state: EnvState, tool_id: str, kind: str, field: str
+) -> None:
+    class UncopyablePayload(Payload):
+        def __deepcopy__(self, memo):
+            raise RuntimeError("Cannot copy payload")
+
+    record_id = (
+        tool_id if kind == "tool_call" else state.register_planner(backend="api")
+    )
+    before = state.planner_records()
+    with pytest.raises(RuntimeError, match="Cannot copy payload"):
+        getattr(state, f"update_{kind}")(
+            record_id,
+            status="failed",
+            source_ids={"test.id": "changed"},
+            missing={"ended_at": MissingInfo("not_recorded", "No timestamp.")},
+            **{field: UncopyablePayload("test.data", {})},
+        )
+    assert state.planner_records() == before
 
 
 def test_model_and_action_trajectories_share_explicit_links(state: EnvState) -> None:
@@ -158,11 +473,9 @@ def test_model_and_action_trajectories_share_explicit_links(state: EnvState) -> 
     second = state.register_planner(backend="api", status="completed")
     observations = [
         state.register_observation(
-            control_step=step,
-            capture_sequence=sequence,
-            payload=Payload("test.observation", {"position": step}),
+            payload=Payload("test.observation", {"position": position}),
         )
-        for sequence, step in enumerate([0, 1, 1, 2])
+        for position in [0, 1, 1, 2]
     ]
     first_tool = state.register_tool_call(
         planner_id=first,
@@ -187,28 +500,25 @@ def test_model_and_action_trajectories_share_explicit_links(state: EnvState) -> 
         status="completed",
     )
     action_ids = []
-    for tool, step, before, after, source in [
-        (second_tool, 1, observations[2], observations[3], "tool_computed"),
-        (first_tool, 0, observations[0], observations[1], "vla"),
-        (second_tool, None, observations[3], None, "direct"),
+    for tool, before, after, source in [
+        (first_tool, observations[0], observations[1], "vla"),
+        (second_tool, observations[2], observations[3], "tool_computed"),
+        (second_tool, observations[3], None, "direct"),
     ]:
         action_ids.append(
             state.register_action(
                 tool_call_id=tool,
                 source=source,
-                action_format_id="joint",
-                control_step=step,
                 action=Payload("test.action", [0.5]),
                 before_observation_id=before,
                 after_observation_id=after,
                 missing=(
                     {
-                        "control_step": MissingInfo("not_exposed", "Position unknown."),
                         "after_observation_id": MissingInfo(
                             "capture_failed", "Camera failed."
                         ),
                     }
-                    if step is None
+                    if after is None
                     else {}
                 ),
             )
@@ -223,13 +533,9 @@ def test_model_and_action_trajectories_share_explicit_links(state: EnvState) -> 
     assert [call.tool_call_id for call in planners[1].tool_calls] == [second_tool]
     assert state.get_tool_call(read_tool).planner_id == first
     actions = state.action_records()
-    assert [record.action_id for record in actions] == [
-        action_ids[1],
-        action_ids[0],
-        action_ids[2],
-    ]
-    assert [record.control_step for record in actions] == [0, 1, None]
+    assert [record.action_id for record in actions] == action_ids
     assert [record.source for record in actions] == ["vla", "tool_computed", "direct"]
+    assert {record.action.format for record in actions} == {"test.action"}
     assert actions[1].after_observation_id == actions[2].before_observation_id
     assert (
         actions[0].after_observation_id
@@ -237,12 +543,11 @@ def test_model_and_action_trajectories_share_explicit_links(state: EnvState) -> 
     )
     assert observations[1] != observations[2]
     assert (
-        state.get_observation(observations[1]).control_step
-        == state.get_observation(observations[2]).control_step
+        state.get_observation(observations[1]).payload.data
+        == state.get_observation(observations[2]).payload.data
     )
-    assert state.get_observation(observations[2]).capture_sequence == 2
     assert state.get_tool_call(actions[1].tool_call_id).planner_id == second
-    assert actions[2].missing["control_step"].reason == "not_exposed"
+    assert actions[2].missing["after_observation_id"].reason == "capture_failed"
 
 
 def test_registration_and_queries_isolate_nested_payloads(tmp_path: Path) -> None:
@@ -264,15 +569,19 @@ def test_registration_and_queries_isolate_nested_payloads(tmp_path: Path) -> Non
         raw_result=raw_result,
     )
     values = np.array([0.1, 0.2], dtype=np.float32)
-    obs = state.register_observation(
-        control_step=0, capture_sequence=0, payload=Payload("test.obs", values)
+    obs = state.register_observation(payload=Payload("test.obs", values))
+    missing = {"/gripper": MissingInfo("not_exposed", "Gripper command unavailable.")}
+    action_payload = Payload(
+        "test.joint_action",
+        {"joints": values},
+        format_version="1",
+        completeness="partial",
+        missing=missing,
     )
     action = state.register_action(
         tool_call_id=tool,
         source="vla",
-        action_format_id="joint",
-        control_step=0,
-        action=Payload("test.action", {"joints": values}),
+        action=action_payload,
         before_observation_id=obs,
         after_observation_id=None,
         result=Payload("test.result", DataRef("tool_call", tool, "/raw_result/data")),
@@ -282,6 +591,10 @@ def test_registration_and_queries_isolate_nested_payloads(tmp_path: Path) -> Non
     request.data["messages"].clear()
     source_ids.clear()
     raw_result.data["done"] = False
+    action_payload.format = "test.changed"
+    action_payload.format_version = "2"
+    missing["/gripper"].detail = "Changed"
+    missing.clear()
     values[:] = 99
     state.get_task().config.data.clear()
     state.get_planner(planner).request.data.clear()
@@ -289,7 +602,13 @@ def test_registration_and_queries_isolate_nested_payloads(tmp_path: Path) -> Non
     state.get_observation(obs).payload.data[:] = 88
     state.get_action(action).action.data["joints"][:] = 77
     state.planner_records()[0].tool_calls.clear()
-    state.action_records()[0].before_observation_id = None
+    actions = state.action_records()
+    actions[0].before_observation_id = None
+    actions[0].action.format = "test.changed_again"
+    actions[0].action.format_version = "3"
+    actions[0].action.missing.clear()
+    actions[0].action.data["joints"][:] = 66
+    actions.clear()
 
     assert state.get_task().config.data == {"model": {"max_tokens": 1024}}
     assert state.get_planner(planner).request.data["messages"][0]["content"] == "Move."
@@ -304,6 +623,12 @@ def test_registration_and_queries_isolate_nested_payloads(tmp_path: Path) -> Non
     )
     assert stored.before_observation_id == obs
     assert stored.result.data == DataRef("tool_call", tool, "/raw_result/data")
+    assert stored.action.format == "test.joint_action"
+    assert stored.action.format_version == "1"
+    assert stored.action.completeness == "partial"
+    assert stored.action.missing == {
+        "/gripper": MissingInfo("not_exposed", "Gripper command unavailable.")
+    }
     outcome = Payload("test.result", {"environment_success": False})
     state.end_task(status="completed", stop_reason="finish", result=outcome)
     outcome.data.clear()
@@ -321,15 +646,11 @@ def test_interleaved_registration_keeps_ids_and_parent_links(state: EnvState) ->
             arguments=Payload("json", {"index": index}),
         )
         observation = state.register_observation(
-            control_step=index,
-            capture_sequence=index,
             payload=Payload("test.obs", index),
         )
         action = state.register_action(
             tool_call_id=tool,
             source="direct",
-            action_format_id="joint",
-            control_step=index,
             action=Payload("test.action", [index]),
             before_observation_id=observation,
             after_observation_id=None,
@@ -340,12 +661,16 @@ def test_interleaved_registration_keeps_ids_and_parent_links(state: EnvState) ->
         identities = list(pool.map(register, range(32)))
 
     assert len({identity for group in identities for identity in group}) == 96
-    assert [action.control_step for action in state.action_records()] == list(range(32))
+    assert [action.action_id for action in state.action_records()] == [
+        f"A{index}" for index in range(1, 33)
+    ]
     for index, (tool, observation, action) in enumerate(identities):
         assert state.get_tool_call(tool).planner_id == planners[index % 2]
         assert state.get_tool_call(tool).arguments.data == {"index": index}
         assert state.get_action(action).tool_call_id == tool
         assert state.get_action(action).before_observation_id == observation
+        assert state.get_action(action).action.format == "test.action"
+        assert state.get_action(action).action.data == [index]
         assert state.get_observation(observation).payload.data == index
     for index, planner in enumerate(state.planner_records()):
         assert sorted(
@@ -360,17 +685,13 @@ def test_legacy_reset_and_rollback_preserve_task_records(
     original_planner = state.get_tool_call(tool_id).planner_id
     with state.record_step(state={"initial": True}):
         state.save("old.bin", b"initial")
-    observation = state.register_observation(
-        control_step=0, capture_sequence=0, payload=Payload("test.obs", [0])
-    )
+    observation = state.register_observation(payload=Payload("test.obs", [0]))
     with pytest.raises(RuntimeError, match="failed to record step"):
         with state.record_step(state={"partial": True}) as step:
             state.save("partial.bin", b"partial")
             action = state.register_action(
                 tool_call_id=tool_id,
                 source="direct",
-                action_format_id="joint",
-                control_step=0,
                 action=Payload("test.action", [1]),
                 before_observation_id=observation,
                 after_observation_id=None,
@@ -383,6 +704,7 @@ def test_legacy_reset_and_rollback_preserve_task_records(
     assert state.load("old.bin", step=0) == b"initial"
     assert state.get_task() == task
     assert state.get_action(action).before_observation_id == observation
+    assert state.get_action(action).action.format == "test.action"
     assert state.get_tool_call(tool_id).planner_id == original_planner
     assert state.get_observation(observation).payload.data == [0]
     assert state.register_planner(backend="api") != original_planner
@@ -392,18 +714,11 @@ def test_legacy_reset_and_rollback_preserve_task_records(
         )
         != tool_id
     )
-    assert (
-        state.register_observation(
-            control_step=0, capture_sequence=1, payload=Payload("test.obs", [0])
-        )
-        != observation
-    )
+    assert state.register_observation(payload=Payload("test.obs", [0])) != observation
     assert (
         state.register_action(
             tool_call_id=tool_id,
             source="direct",
-            action_format_id="joint",
-            control_step=1,
             action=Payload("test.action", [2]),
             before_observation_id=observation,
             after_observation_id=None,
@@ -416,6 +731,10 @@ def test_legacy_reset_and_rollback_preserve_task_records(
 
 def test_unknown_parents_do_not_publish_child_records(state: EnvState) -> None:
     with pytest.raises(KeyError, match="unknown-planner"):
+        state.update_planner("unknown-planner", status="failed")
+    with pytest.raises(KeyError, match="unknown-tool"):
+        state.update_tool_call("unknown-tool", status="not_executed")
+    with pytest.raises(KeyError, match="unknown-planner"):
         state.register_tool_call(
             planner_id="unknown-planner", name="move", arguments=Payload("json", {})
         )
@@ -423,9 +742,7 @@ def test_unknown_parents_do_not_publish_child_records(state: EnvState) -> None:
         state.register_action(
             tool_call_id="unknown-tool",
             source="direct",
-            action_format_id="joint",
-            control_step=0,
-            action=Payload("json", [1]),
+            action=Payload("test.action", [1]),
             before_observation_id=None,
             after_observation_id=None,
         )
@@ -439,3 +756,328 @@ def test_unknown_parents_do_not_publish_child_records(state: EnvState) -> None:
     ]:
         with pytest.raises(KeyError):
             get("unknown")
+
+
+def test_one_tool_keeps_mixed_action_protocols_in_execution_order(
+    state: EnvState, tool_id: str
+) -> None:
+    payloads = [
+        Payload(
+            "test.joints", np.array([0.1, 0.2], dtype=np.float32), format_version="1"
+        ),
+        Payload(
+            "test.pose",
+            {"position": np.array([0.3, 0.4, 0.5], dtype=np.float64)},
+            format_version="2",
+        ),
+        Payload(
+            "test.joints", np.array([0.6, 0.7], dtype=np.float32), format_version="1"
+        ),
+    ]
+    observations = [
+        state.register_observation(payload=Payload("test.observation", [index]))
+        for index in range(4)
+    ]
+    action_ids = [
+        state.register_action(
+            tool_call_id=tool_id,
+            source="tool_computed",
+            action=payload,
+            before_observation_id=observations[index],
+            after_observation_id=observations[index + 1],
+        )
+        for index, payload in enumerate(payloads)
+    ]
+
+    records = state.action_records()
+    assert [record.action_id for record in records] == action_ids
+    assert [record.action.format for record in records] == [
+        "test.joints",
+        "test.pose",
+        "test.joints",
+    ]
+    assert [record.action.format_version for record in records] == ["1", "2", "1"]
+    for index, record in enumerate(records):
+        assert record.tool_call_id == tool_id
+        assert record.before_observation_id == observations[index]
+        assert record.after_observation_id == observations[index + 1]
+    for index in (0, 2):
+        np.testing.assert_array_equal(records[index].action.data, payloads[index].data)
+        assert records[index].action.data.dtype == np.dtype("float32")
+    np.testing.assert_array_equal(
+        records[1].action.data["position"], payloads[1].data["position"]
+    )
+    assert records[1].action.data["position"].dtype == np.dtype("float64")
+    for record in records:
+        stored = state.get_action(record.action_id)
+        assert (stored.action.format, stored.action.format_version) == (
+            record.action.format,
+            record.action.format_version,
+        )
+
+
+@pytest.mark.parametrize("started", [False, True])
+def test_planner_trajectory_requires_an_ended_task(tmp_path, started):
+    state = EnvState(tmp_path)
+    if started:
+        state.start_task(instruction="Move.", config=Payload("json", {}))
+    with pytest.raises(RuntimeError, match=r"end_task\(\) must finish"):
+        state.save_planner_trajectory()
+    assert not (tmp_path / "trajectories").exists()
+
+
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
+def test_planner_trajectory_preserves_records_and_registration_order(
+    state, tmp_path, status
+):
+    timestamp = datetime.now(timezone.utc)
+    planner_ids = [
+        state.register_planner(
+            backend="api",
+            status="completed",
+            request=Payload(
+                "pydantic_ai.request",
+                {"messages": [{"content": "移动杯子"}], "tools": [{"name": "move"}]},
+                format_version="test-sdk",
+                completeness="complete",
+            ),
+            response=Payload("pydantic_ai.response", {"parts": [{"text": str(index)}]}),
+            source_ids={"provider.response_id": f"response-{index}"},
+            started_at=timestamp,
+            ended_at=timestamp,
+        )
+        for index in range(12)
+    ]
+    tool_ids = [
+        state.register_tool_call(
+            planner_id=planner_ids[0],
+            name="move",
+            arguments=Payload("json", {"position": index}),
+            status="completed",
+            source_ids={"pydantic_ai.tool_call_id": f"call-{index}"},
+            effective_instruction="Move.",
+            model_config=Payload("test.config", {"model": "test"}),
+            started_at=timestamp,
+            ended_at=timestamp,
+            raw_result=Payload("rpent.tool_result", {"distance": index}),
+            feedback=Payload("pydantic_ai.tool_result", f"Moved {index}."),
+            missing={
+                "before_observation_id": MissingInfo("not_recorded", "No capture")
+            },
+        )
+        for index in range(12)
+    ]
+    state.register_planner(
+        backend="api",
+        status="failed",
+        request=Payload("pydantic_ai.request", {"messages": []}),
+        missing={"response": MissingInfo("capture_failed", "Request interrupted")},
+    )
+    state.end_task(
+        status=status, stop_reason="test", result=Payload("test.result", {"score": 0})
+    )
+
+    root = state.save_planner_trajectory()
+
+    task = state.get_task()
+    assert root == tmp_path / "trajectories" / task.task_id
+    saved_task = json.loads((root / "task.json").read_text())
+    assert saved_task == {
+        "schema_version": 1,
+        "task": json.loads(json.dumps(asdict(task), default=datetime.isoformat)),
+    }
+    records = [
+        json.loads(line) for line in (root / "planners.jsonl").read_text().splitlines()
+    ]
+    assert records == json.loads(
+        json.dumps(
+            [asdict(record) for record in state.planner_records()],
+            default=datetime.isoformat,
+        )
+    )
+    assert [record["planner_id"] for record in records[:-1]] == planner_ids
+    assert [tool["tool_call_id"] for tool in records[0]["tool_calls"]] == tool_ids
+    assert records[-1]["response"] is None
+    assert records[-1]["missing"]["response"]["reason"] == "capture_failed"
+    assert not (tmp_path / "states.json").exists()
+
+
+def test_planner_trajectory_externalizes_nested_data_without_mutating_records(tmp_path):
+    state = EnvState(tmp_path)
+    state.start_task(instruction="Move.", config=Payload("test.config", b"config"))
+    image = np.arange(12, dtype=np.uint16).reshape(3, 4)
+    existing = ArtifactRef("artifacts/existing.bin", "bytes", media_type="image/png")
+    planner = state.register_planner(backend="api", status="completed")
+    tool = state.register_tool_call(
+        planner_id=planner,
+        name="move",
+        arguments=Payload("json", {}),
+        raw_result=Payload(
+            "test.raw",
+            {
+                "nested": [{"image": image, "bytes": b"\x00\xff"}],
+                "existing": existing,
+                "scalar": np.int64(42),
+            },
+        ),
+    )
+    reference = DataRef("tool_call", tool, "/raw_result/data/nested/0/image")
+    state.update_tool_call(tool, feedback=Payload("test.feedback", reference))
+    state.end_task(status="completed", stop_reason="finish")
+    expected_root = tmp_path / "trajectories" / state.get_task().task_id
+    (expected_root / "artifacts").mkdir(parents=True)
+    (expected_root / existing.path).write_bytes(b"existing attachment")
+
+    root = state.save_planner_trajectory()
+
+    record = json.loads((root / "planners.jsonl").read_text())
+    data = record["tool_calls"][0]["raw_result"]["data"]
+    image_ref = data["nested"][0]["image"]
+    assert image_ref["$type"] == "artifact_ref"
+    assert image_ref["kind"] == "ndarray"
+    assert image_ref["dtype"] == "uint16" and image_ref["shape"] == [3, 4]
+    restored = np.load(root / image_ref["path"], allow_pickle=False)
+    np.testing.assert_array_equal(restored, image)
+    assert restored.dtype == image.dtype
+    bytes_ref = data["nested"][0]["bytes"]
+    assert bytes_ref["kind"] == "bytes"
+    assert (root / bytes_ref["path"]).read_bytes() == b"\x00\xff"
+    assert data["existing"] == {"$type": "artifact_ref", **asdict(existing)}
+    assert (root / existing.path).read_bytes() == b"existing attachment"
+    assert data["scalar"] == 42
+    assert record["tool_calls"][0]["feedback"]["data"] == {
+        "$type": "data_ref",
+        **asdict(reference),
+    }
+    task_config = json.loads((root / "task.json").read_text())["task"]["config"]["data"]
+    assert (root / task_config["path"]).read_bytes() == b"config"
+    stored = state.get_tool_call(tool)
+    np.testing.assert_array_equal(stored.raw_result.data["nested"][0]["image"], image)
+    assert stored.raw_result.data["nested"][0]["bytes"] == b"\x00\xff"
+    assert stored.raw_result.data["existing"] == existing
+    assert stored.feedback.data == reference
+    assert state.get_task().config.data == b"config"
+
+    files = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    assert state.save_planner_trajectory() == root
+    assert {
+        path: path.read_bytes() for path in root.rglob("*") if path.is_file()
+    } == files
+
+
+def test_planner_trajectory_saves_a_task_without_model_calls(state):
+    state.end_task(status="failed", stop_reason="setup_error")
+    root = state.save_planner_trajectory()
+    assert (root / "planners.jsonl").read_text() == ""
+    assert json.loads((root / "task.json").read_text())["task"]["status"] == "failed"
+
+
+@pytest.mark.parametrize("suffix", [".bin", ".npy"])
+@pytest.mark.parametrize("stem", ["payload-000001", ".payload-000001.tmp"])
+def test_planner_trajectory_preserves_referenced_attachment_paths(
+    tmp_path, suffix, stem
+):
+    state = EnvState(tmp_path)
+    existing = ArtifactRef(
+        f"artifacts/{stem}{suffix}",
+        "bytes" if suffix == ".bin" else "ndarray",
+    )
+    task_id = state.start_task(
+        instruction="Move.", config=Payload("test.config", {"existing": [existing]})
+    )
+    native = b"new capture" if suffix == ".bin" else np.array([1.5], dtype=np.float32)
+    state.register_planner(backend="api", request=Payload("test.request", native))
+    state.end_task(status="completed", stop_reason="finish")
+    root = tmp_path / "trajectories" / task_id
+    (root / "artifacts").mkdir(parents=True)
+    if suffix == ".bin":
+        (root / existing.path).write_bytes(b"existing attachment")
+    else:
+        np.save(root / existing.path, np.array([9.0], dtype=np.float32))
+    original = (root / existing.path).read_bytes()
+
+    state.save_planner_trajectory()
+
+    request = json.loads((root / "planners.jsonl").read_text())["request"]["data"]
+    assert request["path"] != existing.path
+    assert (root / existing.path).read_bytes() == original
+    if suffix == ".bin":
+        assert (root / request["path"]).read_bytes() == native
+    else:
+        np.testing.assert_array_equal(
+            np.load(root / request["path"], allow_pickle=False), native
+        )
+    files = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    state.save_planner_trajectory()
+    assert {
+        path: path.read_bytes() for path in root.rglob("*") if path.is_file()
+    } == files
+
+
+def test_planner_trajectory_distinguishes_references_and_literal_tags(state):
+    reference = DataRef("tool_call", "T1", "/raw_result/data")
+    artifact = ArtifactRef("artifacts/existing.bin", "bytes")
+    literal = {"$type": "data_ref", **asdict(reference)}
+    literal_artifact = {"$type": "artifact_ref", **asdict(artifact)}
+    literal_float = {"$type": "float", "value": "nan"}
+    literal_dict = {"$type": "dict", "value": literal}
+    payload = {
+        "reference": reference,
+        "artifact": artifact,
+        "literals": [literal, literal_artifact, literal_float, literal_dict],
+    }
+    planner_id = state.register_planner(
+        backend="api", request=Payload("test.request", payload)
+    )
+    state.end_task(status="completed", stop_reason="finish")
+
+    root = state.save_planner_trajectory()
+
+    data = json.loads((root / "planners.jsonl").read_text())["request"]["data"]
+    assert data["reference"] == literal
+    assert data["artifact"] == literal_artifact
+    assert data["literals"] == [
+        {"$type": "dict", "value": literal},
+        {"$type": "dict", "value": literal_artifact},
+        {"$type": "dict", "value": literal_float},
+        {
+            "$type": "dict",
+            "value": {
+                "$type": "dict",
+                "value": {"$type": "dict", "value": literal},
+            },
+        },
+    ]
+    assert state.get_planner(planner_id).request.data == payload
+
+
+@pytest.mark.parametrize(
+    "filename", ["payload-000001.bin", "planners.jsonl", "task.json"]
+)
+def test_planner_trajectory_write_failure_is_visible_and_retryable(
+    state, tmp_path, monkeypatch, filename
+):
+    state.register_planner(
+        backend="api", status="completed", request=Payload("test.request", b"request")
+    )
+    state.end_task(status="completed", stop_reason="finish")
+    root = tmp_path / "trajectories" / state.get_task().task_id
+    replace = os.replace
+
+    def fail_replace(source, destination):
+        if destination.name == filename:
+            raise OSError("disk full")
+        replace(source, destination)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("rpent.session.base.os.replace", fail_replace)
+        with pytest.raises(OSError, match="disk full"):
+            state.save_planner_trajectory()
+    assert not (root / "task.json").exists()
+    assert not list(root.rglob(".*.tmp*"))
+    assert state.planner_records()[0].request.data == b"request"
+
+    assert state.save_planner_trajectory() == root
+    assert (root / "task.json").is_file()
+    request = json.loads((root / "planners.jsonl").read_text())["request"]["data"]
+    assert (root / request["path"]).read_bytes() == b"request"
