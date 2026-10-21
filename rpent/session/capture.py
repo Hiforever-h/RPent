@@ -36,6 +36,7 @@ from rpent.session import EnvState, MissingInfo, Payload
 
 SDK_VERSION = version("pydantic-ai-slim")
 _REQUEST_PARAMETERS = TypeAdapter(ModelRequestParameters)
+_SDK_VALUES = TypeAdapter(Any)
 
 
 class ToolCallCapture:
@@ -94,12 +95,23 @@ current_tool_call: ContextVar[ToolCallCapture | None] = ContextVar(
 )
 
 
+def _sdk_data(value: Any) -> Any:
+    """Normalize a Python-mode SDK snapshot while retaining binary attachments."""
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, dict):
+        return {key: _sdk_data(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sdk_data(item) for item in value]
+    return to_jsonable_python(value, bytes_mode="base64")
+
+
 def sdk_payload(format: str, data: Any) -> Payload:
     """Preserve SDK values, including binary content, in a serializable snapshot."""
     return Payload(
         format=format,
         format_version=SDK_VERSION,
-        data=to_jsonable_python(data, bytes_mode="base64"),
+        data=_sdk_data(_SDK_VALUES.dump_python(data, mode="python")),
         completeness="complete",
     )
 
@@ -220,8 +232,8 @@ class CapturingModel(WrapperModel):
                 format_version=SDK_VERSION,
                 data={
                     "model": {"provider": self.system, "name": self.model_name},
-                    "messages": ModelMessagesTypeAdapter.dump_python(
-                        messages, mode="json"
+                    "messages": _sdk_data(
+                        ModelMessagesTypeAdapter.dump_python(messages, mode="python")
                     ),
                     "model_settings": to_jsonable_python(settings, bytes_mode="base64"),
                     "model_request_parameters": _REQUEST_PARAMETERS.dump_python(
@@ -257,7 +269,9 @@ class CapturingModel(WrapperModel):
             payload = Payload(
                 format="pydantic_ai.model_response",
                 format_version=SDK_VERSION,
-                data=ModelMessagesTypeAdapter.dump_python([response], mode="json")[0],
+                data=_sdk_data(
+                    ModelMessagesTypeAdapter.dump_python([response], mode="python")[0]
+                ),
                 completeness="complete" if status == "completed" else "partial",
             )
             if status != "completed":

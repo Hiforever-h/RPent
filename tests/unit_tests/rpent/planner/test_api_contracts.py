@@ -37,6 +37,7 @@ from pydantic_ai import (
 from pydantic_ai.exceptions import UnexpectedModelBehavior, UsageLimitExceeded
 from pydantic_ai.models.function import DeltaThinkingPart, DeltaToolCall, FunctionModel
 from pydantic_ai.models.test import TestModel
+from pydantic_core import to_jsonable_python
 
 from rpent.dashboard.events import RunStartedEvent, TranscriptEvent, UsageEvent
 from rpent.dashboard.state import DashboardState
@@ -406,6 +407,18 @@ def test_read_image_returns_saved_artifact_and_records_call(
         "tool_call",
         "tool_result",
     ]
+    toolkit.close()
+    image_state.end_task(status="completed", stop_reason=result.stop_reason)
+    root = image_state.save_planner_trajectory()
+    saved = [
+        json.loads(line) for line in (root / "planners.jsonl").read_text().splitlines()
+    ]
+    restored = restore_byte_artifacts(saved, root)
+    assert restored[0]["tool_calls"][0]["raw_result"]["data"] == call.raw_result.data
+    assert restored[0]["tool_calls"][0]["feedback"]["data"] == call.feedback.data
+    assert len(list((root / "artifacts").iterdir())) == (0 if no_images else 1)
+    if not no_images:
+        assert call.feedback.data["content"][0]["data"] == expected_bytes
 
 
 @pytest.mark.parametrize(
@@ -632,9 +645,13 @@ def test_harness_compacts_long_history(tmp_path):
         tmp_path, FunctionModel(stream_function=stream), toolkit, max_turns=50
     )
     assert result.error is None
-    assert [
-        p.request.data["messages"] for p in toolkit.state.planner_records()
-    ] == requests
+    assert (
+        to_jsonable_python(
+            [p.request.data["messages"] for p in toolkit.state.planner_records()],
+            bytes_mode="base64",
+        )
+        == requests
+    )
     assert any(after < before for before, after in zip(lengths, lengths[1:]))
     assert result.messages[0] == {"role": "user", "content": "Do the task."}
     assert len([m for m in result.messages if m["role"] == "assistant"]) == 45
@@ -1272,6 +1289,17 @@ def capturing_toolkit(tmp_path, events=None):
     return RobotToolkit(events or Events(), state=state)
 
 
+def restore_byte_artifacts(value, root):
+    if isinstance(value, list):
+        return [restore_byte_artifacts(item, root) for item in value]
+    if isinstance(value, dict):
+        if value.get("$type") == "artifact_ref":
+            assert value["kind"] == "bytes"
+            return (root / value["path"]).read_bytes()
+        return {key: restore_byte_artifacts(item, root) for key, item in value.items()}
+    return value
+
+
 @pytest.mark.parametrize("no_images", [False, True])
 def test_capture_keeps_original_tool_result_and_actual_multimodal_feedback(
     tmp_path, no_images
@@ -1280,32 +1308,39 @@ def test_capture_keeps_original_tool_result_and_actual_multimodal_feedback(
 
     toolkit = capturing_toolkit(tmp_path)
     original = {"executed_steps": 2, "text": "a" * 61000}
+    original_image = b"\x00\xfforiginal image"
+    observation_image = b"\x00\xffobservation image"
 
     @declare_tool
     def move() -> ToolResult:
-        return ToolResult(data=original, images=[b"original image"])
+        return ToolResult(data=original, images=[original_image])
 
     toolkit.add_tool(move)
     toolkit.get_env_state = lambda **kwargs: ToolResult(
-        data={"position": 5}, images=[b"observation image"]
+        data={"position": 5}, images=[observation_image]
     )
     seen = []
 
     async def stream(messages, info):
         seen.append(ModelMessagesTypeAdapter.dump_python(messages, mode="json"))
-        yield tool("move") if len(seen) == 1 else finish()
+        yield tool("move") if len(seen) < 3 else finish()
 
     result, _, _ = solve(
         tmp_path, FunctionModel(stream_function=stream), toolkit, no_images=no_images
     )
     assert result.error is None
     planners = toolkit.state.planner_records()
-    assert [p.status for p in planners] == ["completed", "completed"]
-    assert [p.request.data["messages"] for p in planners] == seen
+    assert [p.status for p in planners] == ["completed"] * 3
+    assert (
+        to_jsonable_python(
+            [p.request.data["messages"] for p in planners], bytes_mode="base64"
+        )
+        == seen
+    )
     assert planners[0].request.data["model_request_parameters"]["function_tools"]
     assert planners[0].request.data["model_request_parameters"]["output_tools"]
     call = planners[0].tool_calls[0]
-    assert call.raw_result.data == {"data": original, "images": [b"original image"]}
+    assert call.raw_result.data == {"data": original, "images": [original_image]}
     assert json.loads(call.feedback.data["return_value"][0]) == {"position": 5}
     image_content = call.feedback.data["return_value"][1:]
     assert len(image_content) == 2
@@ -1313,6 +1348,11 @@ def test_capture_keeps_original_tool_result_and_actual_multimodal_feedback(
         isinstance(item, str) if no_images else item["kind"] == "binary"
         for item in image_content
     )
+    if not no_images:
+        assert [item["data"] for item in image_content] == [
+            original_image,
+            observation_image,
+        ]
     assert call.before_observation_id is None
     assert call.missing["before_observation_id"].reason == "not_recorded"
     assert call.started_at <= call.ended_at
@@ -1325,15 +1365,26 @@ def test_capture_keeps_original_tool_result_and_actual_multimodal_feedback(
     saved = [
         json.loads(line) for line in (root / "planners.jsonl").read_text().splitlines()
     ]
-    assert [p["request"]["data"]["messages"] for p in saved] == seen
-    assert [p["response"]["data"] for p in saved] == [
+    restored = restore_byte_artifacts(saved, root)
+    assert (
+        to_jsonable_python(
+            [p["request"]["data"]["messages"] for p in restored], bytes_mode="base64"
+        )
+        == seen
+    )
+    assert [p["response"]["data"] for p in restored] == [
         planner.response.data for planner in planners
     ]
     saved_call = saved[0]["tool_calls"][0]
-    assert saved_call["feedback"]["data"] == call.feedback.data
+    assert restored[0]["tool_calls"][0]["feedback"]["data"] == call.feedback.data
     assert saved_call["raw_result"]["data"]["data"] == original
     image_ref = saved_call["raw_result"]["data"]["images"][0]
-    assert (root / image_ref["path"]).read_bytes() == b"original image"
+    assert (root / image_ref["path"]).read_bytes() == original_image
+    assert saved[1]["tool_calls"][0]["raw_result"]["data"]["images"][0] == image_ref
+    if not no_images:
+        assert saved_call["feedback"]["data"]["return_value"][1]["data"] == image_ref
+    assert len(list((root / "artifacts").iterdir())) == (1 if no_images else 2)
+    assert toolkit.state.planner_records() == planners
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
@@ -1411,13 +1462,46 @@ def test_capture_keeps_model_failure_and_partial_response(tmp_path, partial):
 
 def test_capture_non_streaming_model_request(tmp_path):
     from pydantic_ai import ModelResponse, TextPart
+    from pydantic_ai.messages import (
+        AgentInstructionSource,
+        FilePart,
+        ImageUrl,
+        InstructionId,
+        InstructionPart,
+        ModelMessagesTypeAdapter,
+        ThinkingPart,
+    )
     from pydantic_ai.models import ModelRequestParameters
 
     from rpent.session.capture import CapturingModel
 
     toolkit = capturing_toolkit(tmp_path)
+    image = BinaryContent(
+        b"\x00\xff\xfb\xef", media_type="image/png", vendor_metadata={"detail": "high"}
+    )
+    literal = "AP_77w=="
+    messages = [
+        ModelRequest(
+            parts=[
+                UserPromptPart(
+                    ["hello", image, ImageUrl("https://example.com/image.png"), literal]
+                )
+            ],
+            metadata={"kind": "binary", "data": literal, "media_type": "image/png"},
+        )
+    ]
     response = ModelResponse(
-        parts=[TextPart("done")], provider_response_id="response-1"
+        parts=[
+            TextPart("done"),
+            FilePart(image),
+            ThinkingPart("reasoning", signature=literal),
+        ],
+        provider_response_id="response-1",
+    )
+    parameters = ModelRequestParameters(
+        instruction_parts=[
+            InstructionPart("Look.", id=InstructionId(AgentInstructionSource()))
+        ]
     )
     model = CapturingModel(
         FunctionModel(lambda messages, info: response),
@@ -1426,19 +1510,41 @@ def test_capture_non_streaming_model_request(tmp_path):
     )
     asyncio.run(
         model.request(
-            [ModelRequest(parts=[UserPromptPart("hello")])],
+            messages,
             {"max_tokens": 10},
-            ModelRequestParameters(),
+            parameters,
         )
     )
     (record,) = toolkit.state.planner_records()
     assert record.status == "completed"
     assert record.request.data["model_settings"] == {"max_tokens": 10}
+    assert (
+        record.request.data["model_request_parameters"]["instruction_parts"][0]["id"]
+        == "agent"
+    )
     assert record.response.data["parts"][0]["content"] == "done"
     assert record.source_ids == {
         "pydantic_ai.conversation_id": "conversation-1",
         "provider.response_id": "response-1",
     }
+    toolkit.state.end_task(status="completed", stop_reason="model_output")
+    root = toolkit.state.save_planner_trajectory()
+    saved = json.loads((root / "planners.jsonl").read_text())
+    restored = restore_byte_artifacts(saved, root)
+    restored_messages = ModelMessagesTypeAdapter.validate_python(
+        restored["request"]["data"]["messages"]
+    )
+    restored_response = ModelMessagesTypeAdapter.validate_python(
+        [restored["response"]["data"]]
+    )
+    assert ModelMessagesTypeAdapter.dump_python(
+        restored_messages, mode="json"
+    ) == ModelMessagesTypeAdapter.dump_python(messages, mode="json")
+    assert ModelMessagesTypeAdapter.dump_python(
+        restored_response, mode="json"
+    ) == ModelMessagesTypeAdapter.dump_python([response], mode="json")
+    assert len(list((root / "artifacts").iterdir())) == 1
+    assert toolkit.state.planner_records() == [record]
 
 
 @pytest.mark.parametrize("name,arguments", [("observe", "{"), ("missing_tool", "{}")])

@@ -25,6 +25,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import datetime, timezone
+from hashlib import sha256
 from pathlib import Path
 from typing import IO, Any, Literal
 from uuid import uuid4
@@ -519,16 +520,13 @@ class EnvState:
     # -- planner trajectory storage -------------------------------------
 
     def save_planner_trajectory(self) -> Path:
-        """Save an ended task and its planner calls, returning the trajectory root.
-
-        Non-finite floats use a ``float`` tag with a string ``value``.
-        Literal dictionaries containing ``$type`` use a ``dict`` tag and ``value``.
-        """
+        """Save an ended task and its planner calls, returning the trajectory root."""
         if self._task is None or self._task.status == "running":
             raise RuntimeError("end_task() must finish before saving the trajectory")
         root = self._output_dir / "trajectories" / self._task.task_id
         (root / "artifacts").mkdir(parents=True, exist_ok=True)
         reserved_paths: set[Path] = set()
+        byte_artifacts: dict[str, ArtifactRef] = {}
         attachment_count = 0
 
         def reserve_artifacts(value: Any) -> None:
@@ -554,6 +552,9 @@ class EnvState:
                 value = value.item()
             if isinstance(value, (np.ndarray, bytes)):
                 is_bytes = isinstance(value, bytes)
+                digest = sha256(value).hexdigest() if is_bytes else None
+                if digest is not None and digest in byte_artifacts:
+                    return encode(byte_artifacts[digest])
                 suffix = ".bin" if is_bytes else ".npy"
                 while True:
                     attachment_count += 1
@@ -578,6 +579,8 @@ class EnvState:
                     dtype=None if is_bytes else str(value.dtype),
                     shape=None if is_bytes else value.shape,
                 )
+                if digest is not None:
+                    byte_artifacts[digest] = value
             if is_dataclass(value):
                 data = {
                     item.name: encode(getattr(value, item.name))

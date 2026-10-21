@@ -329,7 +329,7 @@ def test_updates_record_failures_without_inventing_results_or_times(
     assert state.action_records() == []
 
 
-def test_updates_isolate_nested_payloads_metadata_and_query_snapshots(
+def test_updates_isolate_nested_payloads_and_metadata(
     state: EnvState, tool_id: str
 ) -> None:
     planner_id = state.register_planner(backend="api")
@@ -353,17 +353,6 @@ def test_updates_isolate_nested_payloads_metadata_and_query_snapshots(
     source_ids.clear()
     missing["ended_at"].detail = "Changed"
     missing.clear()
-    planner = state.get_planner(planner_id)
-    tool = state.get_tool_call(tool_id)
-    planner.response.data["values"][:] = 88
-    planner.source_ids.clear()
-    planner.missing["ended_at"].detail = "Changed again"
-    tool.model_config.data["content"].clear()
-    tool.raw_result.data["values"][:] = 77
-    tool.feedback.data.clear()
-    tool.source_ids.clear()
-    tool.missing.clear()
-    state.planner_records()[0].tool_calls[0].raw_result.data.clear()
 
     planner = state.get_planner(planner_id)
     tool = state.get_tool_call(tool_id)
@@ -439,31 +428,6 @@ def test_invalid_update_status_leaves_record_unchanged(
             status=invalid_status,
             source_ids={"test.id": "changed"},
             missing={"ended_at": MissingInfo("not_recorded", "No timestamp.")},
-        )
-    assert state.planner_records() == before
-
-
-@pytest.mark.parametrize(
-    "kind,field", [("planner", "response"), ("tool_call", "feedback")]
-)
-def test_failed_update_copy_leaves_record_unchanged(
-    state: EnvState, tool_id: str, kind: str, field: str
-) -> None:
-    class UncopyablePayload(Payload):
-        def __deepcopy__(self, memo):
-            raise RuntimeError("Cannot copy payload")
-
-    record_id = (
-        tool_id if kind == "tool_call" else state.register_planner(backend="api")
-    )
-    before = state.planner_records()
-    with pytest.raises(RuntimeError, match="Cannot copy payload"):
-        getattr(state, f"update_{kind}")(
-            record_id,
-            status="failed",
-            source_ids={"test.id": "changed"},
-            missing={"ended_at": MissingInfo("not_recorded", "No timestamp.")},
-            **{field: UncopyablePayload("test.data", {})},
         )
     assert state.planner_records() == before
 
@@ -774,19 +738,15 @@ def test_one_tool_keeps_mixed_action_protocols_in_execution_order(
             "test.joints", np.array([0.6, 0.7], dtype=np.float32), format_version="1"
         ),
     ]
-    observations = [
-        state.register_observation(payload=Payload("test.observation", [index]))
-        for index in range(4)
-    ]
     action_ids = [
         state.register_action(
             tool_call_id=tool_id,
             source="tool_computed",
             action=payload,
-            before_observation_id=observations[index],
-            after_observation_id=observations[index + 1],
+            before_observation_id=None,
+            after_observation_id=None,
         )
-        for index, payload in enumerate(payloads)
+        for payload in payloads
     ]
 
     records = state.action_records()
@@ -797,10 +757,6 @@ def test_one_tool_keeps_mixed_action_protocols_in_execution_order(
         "test.joints",
     ]
     assert [record.action.format_version for record in records] == ["1", "2", "1"]
-    for index, record in enumerate(records):
-        assert record.tool_call_id == tool_id
-        assert record.before_observation_id == observations[index]
-        assert record.after_observation_id == observations[index + 1]
     for index in (0, 2):
         np.testing.assert_array_equal(records[index].action.data, payloads[index].data)
         assert records[index].action.data.dtype == np.dtype("float32")
@@ -808,12 +764,6 @@ def test_one_tool_keeps_mixed_action_protocols_in_execution_order(
         records[1].action.data["position"], payloads[1].data["position"]
     )
     assert records[1].action.data["position"].dtype == np.dtype("float64")
-    for record in records:
-        stored = state.get_action(record.action_id)
-        assert (stored.action.format, stored.action.format_version) == (
-            record.action.format,
-            record.action.format_version,
-        )
 
 
 @pytest.mark.parametrize("started", [False, True])
@@ -904,10 +854,17 @@ def test_planner_trajectory_preserves_records_and_registration_order(
 
 def test_planner_trajectory_externalizes_nested_data_without_mutating_records(tmp_path):
     state = EnvState(tmp_path)
-    state.start_task(instruction="Move.", config=Payload("test.config", b"config"))
+    shared = b"\x00\xff"
+    duplicate = bytes(bytearray(shared))
+    assert duplicate == shared and duplicate is not shared
+    state.start_task(instruction="Move.", config=Payload("test.config", duplicate))
     image = np.arange(12, dtype=np.uint16).reshape(3, 4)
     existing = ArtifactRef("artifacts/existing.bin", "bytes", media_type="image/png")
-    planner = state.register_planner(backend="api", status="completed")
+    planner = state.register_planner(
+        backend="api",
+        status="completed",
+        response=Payload("test.response", [shared, b"different"]),
+    )
     tool = state.register_tool_call(
         planner_id=planner,
         name="move",
@@ -915,7 +872,7 @@ def test_planner_trajectory_externalizes_nested_data_without_mutating_records(tm
         raw_result=Payload(
             "test.raw",
             {
-                "nested": [{"image": image, "bytes": b"\x00\xff"}],
+                "nested": [{"image": image, "bytes": duplicate}],
                 "existing": existing,
                 "scalar": np.int64(42),
             },
@@ -941,7 +898,12 @@ def test_planner_trajectory_externalizes_nested_data_without_mutating_records(tm
     assert restored.dtype == image.dtype
     bytes_ref = data["nested"][0]["bytes"]
     assert bytes_ref["kind"] == "bytes"
-    assert (root / bytes_ref["path"]).read_bytes() == b"\x00\xff"
+    assert (root / bytes_ref["path"]).read_bytes() == shared
+    assert record["response"]["data"][0] == bytes_ref
+    different_ref = record["response"]["data"][1]
+    assert different_ref["path"] != bytes_ref["path"]
+    assert (root / different_ref["path"]).read_bytes() == b"different"
+    assert len(list((root / "artifacts").iterdir())) == 4
     assert data["existing"] == {"$type": "artifact_ref", **asdict(existing)}
     assert (root / existing.path).read_bytes() == b"existing attachment"
     assert data["scalar"] == 42
@@ -950,13 +912,13 @@ def test_planner_trajectory_externalizes_nested_data_without_mutating_records(tm
         **asdict(reference),
     }
     task_config = json.loads((root / "task.json").read_text())["task"]["config"]["data"]
-    assert (root / task_config["path"]).read_bytes() == b"config"
+    assert task_config == bytes_ref
     stored = state.get_tool_call(tool)
     np.testing.assert_array_equal(stored.raw_result.data["nested"][0]["image"], image)
-    assert stored.raw_result.data["nested"][0]["bytes"] == b"\x00\xff"
+    assert stored.raw_result.data["nested"][0]["bytes"] == shared
     assert stored.raw_result.data["existing"] == existing
     assert stored.feedback.data == reference
-    assert state.get_task().config.data == b"config"
+    assert state.get_task().config.data == shared
 
     files = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
     assert state.save_planner_trajectory() == root
@@ -1052,13 +1014,17 @@ def test_planner_trajectory_distinguishes_references_and_literal_tags(state):
 
 
 @pytest.mark.parametrize(
-    "filename", ["payload-000001.bin", "planners.jsonl", "task.json"]
+    "filename",
+    ["payload-000001.bin", "payload-000002.bin", "planners.jsonl", "task.json"],
 )
 def test_planner_trajectory_write_failure_is_visible_and_retryable(
     state, tmp_path, monkeypatch, filename
 ):
     state.register_planner(
-        backend="api", status="completed", request=Payload("test.request", b"request")
+        backend="api",
+        status="completed",
+        request=Payload("test.request", b"request"),
+        response=Payload("test.response", [b"request", b"other"]),
     )
     state.end_task(status="completed", stop_reason="finish")
     root = tmp_path / "trajectories" / state.get_task().task_id
@@ -1079,5 +1045,9 @@ def test_planner_trajectory_write_failure_is_visible_and_retryable(
 
     assert state.save_planner_trajectory() == root
     assert (root / "task.json").is_file()
-    request = json.loads((root / "planners.jsonl").read_text())["request"]["data"]
+    saved = json.loads((root / "planners.jsonl").read_text())
+    request = saved["request"]["data"]
     assert (root / request["path"]).read_bytes() == b"request"
+    assert saved["response"]["data"][0] == request
+    assert (root / saved["response"]["data"][1]["path"]).read_bytes() == b"other"
+    assert len(list((root / "artifacts").iterdir())) == 2

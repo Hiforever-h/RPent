@@ -402,46 +402,39 @@ class _HarnessToolkit(FunctionToolset):
         if capture is not None:
             capture.start()
         try:
-            try:
-                state = self.toolkit.state
-                record = state.get(step)
-                path = state.artifact_path(name, step=record.step_idx)
-                if name not in record.artifacts or not path.is_file():
-                    raise FileNotFoundError(
-                        f"image artifact {name!r} is not available at step {step}"
-                    )
-                if path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
-                    raise ValueError(f"artifact {name!r} is not an image")
-                metadata = {"artifact": name, "step": record.step_idx}
-                if self.no_images:
-                    result = ToolReturn(
-                        return_value={
-                            **metadata,
-                            "notice": "Image omitted: --no-images is enabled.",
-                        }
-                    )
-                else:
-                    image = BinaryContent(
-                        data=state.load_bytes(name, step=record.step_idx),
-                        media_type=(
-                            "image/jpeg"
-                            if path.suffix.lower() in {".jpg", ".jpeg"}
-                            else "image/png"
-                        ),
-                    )
-                    result = ToolReturn(return_value=metadata, content=[image])
-            except Exception as exc:
-                result = ToolReturn(return_value={"error": str(exc)})
-            if capture is not None:
-                capture.result(sdk_payload("pydantic_ai.tool_return", result))
-                capture.finish(
-                    "failed" if "error" in result.return_value else "completed"
+            state = self.toolkit.state
+            record = state.get(step)
+            path = state.artifact_path(name, step=record.step_idx)
+            if name not in record.artifacts or not path.is_file():
+                raise FileNotFoundError(
+                    f"image artifact {name!r} is not available at step {step}"
                 )
-            return result
-        except BaseException:
-            if capture is not None:
-                capture.finish("failed", "Image read failed.")
-            raise
+            if path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
+                raise ValueError(f"artifact {name!r} is not an image")
+            metadata = {"artifact": name, "step": record.step_idx}
+            if self.no_images:
+                result = ToolReturn(
+                    return_value={
+                        **metadata,
+                        "notice": "Image omitted: --no-images is enabled.",
+                    }
+                )
+            else:
+                image = BinaryContent(
+                    data=state.load_bytes(name, step=record.step_idx),
+                    media_type=(
+                        "image/jpeg"
+                        if path.suffix.lower() in {".jpg", ".jpeg"}
+                        else "image/png"
+                    ),
+                )
+                result = ToolReturn(return_value=metadata, content=[image])
+        except Exception as exc:
+            result = ToolReturn(return_value={"error": str(exc)})
+        if capture is not None:
+            capture.result(sdk_payload("pydantic_ai.tool_return", result))
+            capture.finish("failed" if "error" in result.return_value else "completed")
+        return result
 
     async def execute(
         self, name: str, arguments: dict[str, Any], ctx: RunContext
