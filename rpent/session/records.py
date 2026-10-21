@@ -75,7 +75,7 @@ DataValue: TypeAlias = (
 
 @dataclass
 class Payload:
-    """Native content; ``data=None`` represents a captured null."""
+    """Native content; ``missing`` distinguishes absent data from captured nulls."""
 
     format: str
     data: DataValue

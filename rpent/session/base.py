@@ -428,7 +428,7 @@ class EnvState:
 
         None leaves fields unchanged; model config, raw result, and feedback
         can each only be filled once. Source IDs merge by key; None values in
-        ``missing`` remove reasons.
+        ``missing`` remove reasons. Observation IDs marked missing are cleared.
         """
         with self._records_lock:
             self._running_task()
@@ -459,6 +459,9 @@ class EnvState:
                 source_ids=source_ids,
                 missing=missing,
             )
+            for name in ("before_observation_id", "after_observation_id"):
+                if missing and missing.get(name) is not None:
+                    setattr(record, name, None)
 
     @staticmethod
     def _update_call_record(
@@ -517,10 +520,43 @@ class EnvState:
         with self._records_lock:
             return copy.deepcopy(list(self._actions.values()))
 
-    # -- planner trajectory storage -------------------------------------
+    # -- trajectory storage ---------------------------------------------
+
+    def save_trajectory_artifact(
+        self, value: np.ndarray | bytes, *, name: str | None = None
+    ) -> ArtifactRef:
+        """Store an array or bytes in the task's trajectory and return its reference."""
+        if self._task is None:
+            raise RuntimeError(
+                "start_task() must run before saving trajectory artifacts"
+            )
+        if not isinstance(value, (np.ndarray, bytes)):
+            raise TypeError("trajectory artifacts must be numpy arrays or bytes")
+        is_bytes = isinstance(value, bytes)
+        suffix = ".bin" if is_bytes else ".npy"
+        name = self._validate_name(
+            name if name is not None else f"capture-{uuid4().hex}{suffix}"
+        )
+        if Path(name).suffix != suffix:
+            raise ValueError(f"trajectory artifact name must end with {suffix}")
+        path = f"artifacts/{name}"
+        destination = self._output_dir / "trajectories" / self._task.task_id / path
+        with self._artifact_lock:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with self._write_trajectory_file(destination, binary=True) as file:
+                if is_bytes:
+                    file.write(value)
+                else:
+                    np.save(file, value, allow_pickle=False)
+        return ArtifactRef(
+            path=path,
+            kind="bytes" if is_bytes else "ndarray",
+            dtype=None if is_bytes else str(value.dtype),
+            shape=None if is_bytes else value.shape,
+        )
 
     def save_planner_trajectory(self) -> Path:
-        """Save an ended task and its planner calls, returning the trajectory root."""
+        """Save ended-task records, marking failed attachments as missing."""
         if self._task is None or self._task.status == "running":
             raise RuntimeError("end_task() must finish before saving the trajectory")
         root = self._output_dir / "trajectories" / self._task.task_id
@@ -545,8 +581,17 @@ class EnvState:
         reserve_artifacts(self._task)
         for planner in self._planners.values():
             reserve_artifacts(planner)
+        for observation in self._observations.values():
+            reserve_artifacts(observation)
+        for action in self._actions.values():
+            reserve_artifacts(action)
 
-        def encode(value: Any) -> Any:
+        def encode(
+            value: Any,
+            *,
+            missing: dict[str, MissingInfo] | None = None,
+            pointer: str = "",
+        ) -> Any:
             nonlocal attachment_count
             if isinstance(value, np.generic):
                 value = value.item()
@@ -568,34 +613,49 @@ class EnvState:
                         )
                     ):
                         break
-                with self._write_trajectory_file(destination, binary=True) as file:
-                    if is_bytes:
-                        file.write(value)
-                    else:
-                        np.save(file, value, allow_pickle=False)
-                value = ArtifactRef(
-                    path=path,
-                    kind="bytes" if is_bytes else "ndarray",
-                    dtype=None if is_bytes else str(value.dtype),
-                    shape=None if is_bytes else value.shape,
-                )
+                try:
+                    value = self.save_trajectory_artifact(value, name=destination.name)
+                except OSError as exc:
+                    if missing is None:
+                        raise
+                    missing[pointer] = MissingInfo(
+                        "capture_failed", f"{type(exc).__name__}: {exc}"
+                    )
+                    return None
                 if digest is not None:
                     byte_artifacts[digest] = value
             if is_dataclass(value):
+                failures = {} if isinstance(value, Payload) else None
                 data = {
-                    item.name: encode(getattr(value, item.name))
+                    item.name: encode(
+                        getattr(value, item.name),
+                        missing=failures if item.name == "data" else None,
+                    )
                     for item in fields(value)
                 }
+                if failures:
+                    data["missing"].update(encode(failures))
+                    data["completeness"] = "partial"
                 if isinstance(value, (ArtifactRef, DataRef)):
                     data["$type"] = (
                         "artifact_ref" if isinstance(value, ArtifactRef) else "data_ref"
                     )
                 return data
             if isinstance(value, dict):
-                data = {key: encode(item) for key, item in value.items()}
+                data = {
+                    key: encode(
+                        item,
+                        missing=missing,
+                        pointer=f"{pointer}/{key.replace('~', '~0').replace('/', '~1')}",
+                    )
+                    for key, item in value.items()
+                }
                 return {"$type": "dict", "value": data} if "$type" in value else data
             if isinstance(value, (list, tuple)):
-                return [encode(item) for item in value]
+                return [
+                    encode(item, missing=missing, pointer=f"{pointer}/{index}")
+                    for index, item in enumerate(value)
+                ]
             if isinstance(value, float) and not math.isfinite(value):
                 return {"$type": "float", "value": str(value)}
             if isinstance(value, datetime):
@@ -607,6 +667,26 @@ class EnvState:
         with self._write_trajectory_file(root / "planners.jsonl") as file:
             for planner in self._planners.values():
                 json.dump(encode(planner), file, ensure_ascii=False, allow_nan=False)
+                file.write("\n")
+        observations: dict[str, Any] = {}
+        with self._write_trajectory_file(root / "actions.jsonl") as file:
+            for action in self._actions.values():
+                data = encode(action)
+                for side in ("before", "after"):
+                    observation_id = getattr(action, f"{side}_observation_id")
+                    if (
+                        observation_id is not None
+                        and observation_id not in observations
+                    ):
+                        observations[observation_id] = encode(
+                            self._observations[observation_id]
+                        )
+                    data[f"{side}_observation"] = (
+                        observations[observation_id]
+                        if observation_id is not None
+                        else None
+                    )
+                json.dump(data, file, ensure_ascii=False, allow_nan=False)
                 file.write("\n")
         with self._write_trajectory_file(root / "task.json") as file:
             json.dump(

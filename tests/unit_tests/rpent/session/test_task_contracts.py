@@ -230,6 +230,34 @@ def test_planner_update_preserves_request_tools_and_registration_order(
     assert state.register_planner(backend="api") == "P3"
 
 
+@pytest.mark.parametrize("side", ["before", "after"])
+def test_missing_tool_observation_clears_boundary_without_changing_actions(
+    state: EnvState, tool_id: str, side: str
+) -> None:
+    observation_id = state.register_observation(payload=Payload("test.obs", [1]))
+    state.update_tool_call(
+        tool_id,
+        before_observation_id=observation_id,
+        after_observation_id=observation_id,
+    )
+    action_id = state.register_action(
+        tool_call_id=tool_id,
+        source="direct",
+        action=Payload("test.action", [0.5]),
+        before_observation_id=observation_id,
+        after_observation_id=observation_id,
+    )
+    field = f"{side}_observation_id"
+    reason = MissingInfo("capture_failed", "Environment response was lost.")
+    state.update_tool_call(tool_id, missing={field: reason})
+    assert getattr(state.get_tool_call(tool_id), field) is None
+    assert state.get_tool_call(tool_id).missing[field] == reason
+    assert getattr(state.get_action(action_id), field) == observation_id
+    state.update_tool_call(tool_id, **{field: observation_id}, missing={field: None})
+    assert getattr(state.get_tool_call(tool_id), field) == observation_id
+    assert field not in state.get_tool_call(tool_id).missing
+
+
 @pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
 def test_tool_update_keeps_action_links_and_accepts_late_feedback(
     state: EnvState, tool_id: str, status: str
@@ -931,6 +959,7 @@ def test_planner_trajectory_saves_a_task_without_model_calls(state):
     state.end_task(status="failed", stop_reason="setup_error")
     root = state.save_planner_trajectory()
     assert (root / "planners.jsonl").read_text() == ""
+    assert (root / "actions.jsonl").read_text() == ""
     assert json.loads((root / "task.json").read_text())["task"]["status"] == "failed"
 
 
@@ -1013,18 +1042,28 @@ def test_planner_trajectory_distinguishes_references_and_literal_tags(state):
     assert state.get_planner(planner_id).request.data == payload
 
 
-@pytest.mark.parametrize(
-    "filename",
-    ["payload-000001.bin", "payload-000002.bin", "planners.jsonl", "task.json"],
-)
+@pytest.mark.parametrize("filename", ["planners.jsonl", "actions.jsonl", "task.json"])
 def test_planner_trajectory_write_failure_is_visible_and_retryable(
     state, tmp_path, monkeypatch, filename
 ):
-    state.register_planner(
+    planner = state.register_planner(
         backend="api",
         status="completed",
         request=Payload("test.request", b"request"),
         response=Payload("test.response", [b"request", b"other"]),
+    )
+    tool = state.register_tool_call(
+        planner_id=planner, name="move", arguments=Payload("json", {})
+    )
+    observation = state.register_observation(
+        payload=Payload("test.obs", np.array([0], dtype=np.float32))
+    )
+    state.register_action(
+        tool_call_id=tool,
+        source="direct",
+        action=Payload("test.action", np.array([1], dtype=np.float32)),
+        before_observation_id=observation,
+        after_observation_id=None,
     )
     state.end_task(status="completed", stop_reason="finish")
     root = tmp_path / "trajectories" / state.get_task().task_id
@@ -1050,4 +1089,179 @@ def test_planner_trajectory_write_failure_is_visible_and_retryable(
     assert (root / request["path"]).read_bytes() == b"request"
     assert saved["response"]["data"][0] == request
     assert (root / saved["response"]["data"][1]["path"]).read_bytes() == b"other"
+    action = json.loads((root / "actions.jsonl").read_text())
+    np.testing.assert_array_equal(np.load(root / action["action"]["data"]["path"]), [1])
+    reference = action["before_observation"]["payload"]["data"]
+    np.testing.assert_array_equal(np.load(root / reference["path"]), [0])
+    assert len(list((root / "artifacts").iterdir())) == 4
+
+
+def test_action_trajectory_embeds_observations_and_reuses_attachments(state, tool_id):
+    timestamp = datetime.now(timezone.utc)
+    images = [np.full((2, 2, 3), index, dtype=np.uint8) for index in range(13)]
+    observations = [
+        state.register_observation(
+            payload=Payload("test.obs", {"image": image, "state": [index]}),
+            captured_at=timestamp,
+        )
+        for index, image in enumerate(images)
+    ]
+    state.update_tool_call(tool_id, raw_result=Payload("test.raw", b"shared"))
+    sources = ["tool_computed", "vla", "direct"] * 4
+    action_ids = [
+        state.register_action(
+            tool_call_id=tool_id,
+            source=source,
+            action=Payload("test.action", np.array([index], dtype=np.float32)),
+            before_observation_id=observations[index],
+            after_observation_id=observations[index + 1],
+            executed_at=timestamp,
+            result=Payload(
+                "test.result", {"reward": np.float32(index), "info": b"shared"}
+            ),
+        )
+        for index, source in enumerate(sources)
+    ]
+    state.end_task(status="completed", stop_reason="finish")
+
+    root = state.save_planner_trajectory()
+
+    rows = [
+        json.loads(line) for line in (root / "actions.jsonl").read_text().splitlines()
+    ]
+    planner = json.loads((root / "planners.jsonl").read_text())
+    assert [row["action_id"] for row in rows] == action_ids
+    assert [row["source"] for row in rows] == sources
+    assert {row["tool_call_id"] for row in rows} == {
+        planner["tool_calls"][0]["tool_call_id"]
+    }
+    for index, row in enumerate(rows):
+        assert row["executed_at"] == timestamp.isoformat()
+        action = np.load(root / row["action"]["data"]["path"], allow_pickle=False)
+        np.testing.assert_array_equal(action, [index])
+        assert action.dtype == np.float32
+        assert row["result"]["data"]["reward"] == index
+        assert (
+            row["result"]["data"]["info"]
+            == planner["tool_calls"][0]["raw_result"]["data"]
+        )
+        for side, position in (("before", index), ("after", index + 1)):
+            observation = row[f"{side}_observation"]
+            assert (
+                observation["observation_id"]
+                == row[f"{side}_observation_id"]
+                == observations[position]
+            )
+            assert observation["captured_at"] == timestamp.isoformat()
+            assert observation["payload"]["data"]["state"] == [position]
+            reference = observation["payload"]["data"]["image"]
+            assert reference["$type"] == "artifact_ref"
+            assert reference["dtype"] == "uint8" and reference["shape"] == [2, 2, 3]
+            np.testing.assert_array_equal(
+                np.load(root / reference["path"], allow_pickle=False), images[position]
+            )
+    for previous, following in zip(rows, rows[1:]):
+        assert previous["after_observation"] == following["before_observation"]
+    assert len(list((root / "artifacts").iterdir())) == 13 + 12 + 1
+    assert not (root / "observations.jsonl").exists()
+    assert isinstance(state.get_action(action_ids[0]).action.data, np.ndarray)
+    np.testing.assert_array_equal(
+        state.get_observation(observations[0]).payload.data["image"], images[0]
+    )
+    files = {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+    state.save_planner_trajectory()
+    assert {
+        path: path.read_bytes() for path in root.rglob("*") if path.is_file()
+    } == files
+
+
+def test_action_trajectory_preserves_missing_observations(state, tool_id):
+    missing = {
+        f"{side}_observation_id": MissingInfo("capture_failed", "Camera failed")
+        for side in ("before", "after")
+    }
+    state.register_action(
+        tool_call_id=tool_id,
+        source="direct",
+        action=Payload("test.action", [1]),
+        before_observation_id=None,
+        after_observation_id=None,
+        missing=missing,
+    )
+    state.end_task(status="failed", stop_reason="capture_failed")
+    root = state.save_planner_trajectory()
+    row = json.loads((root / "actions.jsonl").read_text())
+    assert row["before_observation"] is row["after_observation"] is None
+    assert row["missing"] == {key: asdict(value) for key, value in missing.items()}
+
+
+@pytest.mark.parametrize("kind", ["bytes", "ndarray"])
+@pytest.mark.parametrize("owner", ["observation", "action"])
+@pytest.mark.parametrize("stem", ["payload-000001", ".payload-000001.tmp"])
+def test_captured_artifacts_survive_trajectory_save(
+    state, tool_id, tmp_path, kind, owner, stem
+):
+    value = (
+        b"captured" if kind == "bytes" else np.arange(6, dtype=np.uint16).reshape(2, 3)
+    )
+    suffix = ".bin" if kind == "bytes" else ".npy"
+    reference = state.save_trajectory_artifact(value, name=f"{stem}{suffix}")
+    root = tmp_path / "trajectories" / state.get_task().task_id
+    original = (root / reference.path).read_bytes()
+    assert state.get_task().status == "running"
+    assert not (root / "task.json").exists()
+    if kind == "bytes":
+        assert original == value
+    else:
+        np.testing.assert_array_equal(
+            np.load(root / reference.path, allow_pickle=False), value
+        )
+        assert reference.dtype == "uint16" and reference.shape == (2, 3)
+        value[:] = 99
+    observation = state.register_observation(
+        payload=Payload("test.obs", reference if owner == "observation" else {})
+    )
+    state.register_action(
+        tool_call_id=tool_id,
+        source="vla",
+        action=Payload("test.action", reference if owner == "action" else [1]),
+        before_observation_id=observation,
+        after_observation_id=observation,
+    )
+    state.register_planner(
+        backend="api",
+        request=Payload(
+            "test.request", b"different" if kind == "bytes" else np.array([5])
+        ),
+    )
+    state.end_task(status="completed", stop_reason="finish")
+    state.save_planner_trajectory()
+
+    row = json.loads((root / "actions.jsonl").read_text())
+    payload = (
+        row["before_observation"]["payload"]
+        if owner == "observation"
+        else row["action"]
+    )
+    assert payload["data"] == {
+        "$type": "artifact_ref",
+        **json.loads(json.dumps(asdict(reference))),
+    }
+    assert (root / reference.path).read_bytes() == original
     assert len(list((root / "artifacts").iterdir())) == 2
+
+
+def test_trajectory_artifact_requires_task_and_valid_data(tmp_path):
+    state = EnvState(tmp_path)
+    with pytest.raises(RuntimeError, match=r"start_task\(\)"):
+        state.save_trajectory_artifact(b"data")
+    state.start_task(instruction="Move", config=Payload("test.config", {}))
+    with pytest.raises(TypeError, match="arrays or bytes"):
+        state.save_trajectory_artifact([1])
+    with pytest.raises(ValueError, match="base filename"):
+        state.save_trajectory_artifact(b"data", name="../outside.bin")
+    with pytest.raises(ValueError, match=r"end with \.bin"):
+        state.save_trajectory_artifact(b"data", name="data.npy")
+    first = state.save_trajectory_artifact(b"first")
+    second = state.save_trajectory_artifact(b"second")
+    assert first.path != second.path

@@ -19,14 +19,16 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from rpent.cli.task_capture import end_api_task, start_api_task
 from rpent.planner.base import PlannerResult
 from rpent.robots.robot_spec import RunConfig
-from rpent.session import EnvState, Payload
+from rpent.session import EnvState, MissingInfo, Payload
 
 
 @pytest.mark.parametrize(
@@ -52,6 +54,18 @@ def test_task_end_keeps_partial_records_and_actual_stop_cause(
         backend="api",
         status="completed",
         request=Payload("test", {"messages": ["Move the cup."]}),
+    )
+    tool_id = state.register_tool_call(
+        planner_id=planner_id, name="move", arguments=Payload("json", {})
+    )
+    observation_id = state.register_observation(payload=Payload("test.obs", [1]))
+    action_id = state.register_action(
+        tool_call_id=tool_id,
+        source="direct",
+        action=Payload("test.action", [0.5]),
+        before_observation_id=None,
+        after_observation_id=observation_id,
+        missing={"before_observation_id": MissingInfo("capture_failed", "RPC failed.")},
     )
     args.seed = 99
     result = PlannerResult(
@@ -80,6 +94,14 @@ def test_task_end_keeps_partial_records_and_actual_stop_cause(
     )
     assert saved_task["result"]["data"] == task.result.data
     assert json.loads((root / "planners.jsonl").read_text())["planner_id"] == planner_id
+    saved_action = json.loads((root / "actions.jsonl").read_text())
+    assert saved_action["action_id"] == action_id
+    assert saved_action["tool_call_id"] == tool_id
+    assert saved_action["before_observation"] is None
+    assert (
+        saved_action["missing"]["before_observation_id"]["reason"] == "capture_failed"
+    )
+    assert saved_action["after_observation"]["payload"]["data"] == [1]
     with pytest.raises(RuntimeError, match="not running"):
         state.update_planner(planner_id, status="failed")
 
@@ -100,6 +122,111 @@ def test_successful_operator_verdict_is_separate_from_planner_error(tmp_path):
     assert task.result.data["error"] == "interrupted model"
     root = tmp_path / "trajectories" / task.task_id
     assert json.loads((root / "task.json").read_text())["task"]["status"] == "completed"
+
+
+@pytest.mark.parametrize("attachment", ["planner", "action", "observation"])
+def test_task_end_saves_partial_trajectory_after_attachment_failure(
+    tmp_path, monkeypatch, attachment
+):
+    state = EnvState(tmp_path)
+    state.start_task(instruction="Move", config=Payload("test", {}))
+    planner_id = state.register_planner(
+        backend="api",
+        request=Payload(
+            "test.request",
+            {"messages": [{"image/~": b"image", "text": "Move", "optional": None}]},
+            completeness="partial",
+            missing={"/metadata": MissingInfo("not_exposed", "No metadata.")},
+        ),
+    )
+    tool_id = state.register_tool_call(
+        planner_id=planner_id, name="move", arguments=Payload("json", {})
+    )
+    states = np.ones(8, np.float32)
+    observation_id = state.register_observation(
+        payload=Payload("test.obs", {"states": states}, completeness="complete")
+    )
+    actions = [
+        state.register_action(
+            tool_call_id=tool_id,
+            source="vla",
+            action=Payload("test.action", np.array([index]), completeness="complete"),
+            before_observation_id=observation_id if index else None,
+            after_observation_id=None if index else observation_id,
+        )
+        for index in range(2)
+    ]
+    failed_data = {"planner": b"image", "action": np.array([0]), "observation": states}[
+        attachment
+    ]
+    replace = os.replace
+
+    def fail_attachment(source, destination):
+        if destination.parent.name == "artifacts":
+            data = (
+                source.read_bytes()
+                if destination.suffix == ".bin"
+                else np.load(source, allow_pickle=False)
+            )
+            if np.array_equal(data, failed_data):
+                raise OSError("attachment write failed")
+        replace(source, destination)
+
+    with monkeypatch.context() as patch:
+        patch.setattr("rpent.session.base.os.replace", fail_attachment)
+        end_api_task(
+            state,
+            None,
+            finish_result=None,
+            environment_success=False,
+            exception=RuntimeError("model failed"),
+        )
+
+    root = tmp_path / "trajectories" / state.get_task().task_id
+    task = json.loads((root / "task.json").read_text())["task"]
+    request = json.loads((root / "planners.jsonl").read_text())["request"]
+    rows = [
+        json.loads(line) for line in (root / "actions.jsonl").read_text().splitlines()
+    ]
+    assert (task["status"], task["stop_reason"]) == ("failed", "execution_error")
+    assert task["result"]["data"]["error"] == "RuntimeError: model failed"
+    assert [row["action_id"] for row in rows] == actions
+    assert rows[0]["after_observation"] == rows[1]["before_observation"]
+    action = rows[0]["action"]
+    observation = rows[0]["after_observation"]["payload"]
+    payload, pointer, absent = {
+        "planner": (
+            request,
+            "/messages/0/image~1~0",
+            request["data"]["messages"][0]["image/~"],
+        ),
+        "action": (action, "", action["data"]),
+        "observation": (observation, "/states", observation["data"]["states"]),
+    }[attachment]
+    assert absent is None
+    assert payload["completeness"] == "partial"
+    assert payload["missing"][pointer] == {
+        "reason": "capture_failed",
+        "detail": "OSError: attachment write failed",
+    }
+    assert request["missing"]["/metadata"]["reason"] == "not_exposed"
+    assert "/messages/0/optional" not in request["missing"]
+    assert rows[1]["action"]["completeness"] == "complete"
+    np.testing.assert_array_equal(
+        np.load(root / rows[1]["action"]["data"]["path"], allow_pickle=False),
+        [1],
+    )
+    assert not list(root.rglob(".*.tmp*"))
+
+    state.save_planner_trajectory()
+    restored = json.loads((root / "planners.jsonl").read_text())["request"]
+    assert set(restored["missing"]) == {"/metadata"}
+    for line in (root / "actions.jsonl").read_text().splitlines():
+        row = json.loads(line)
+        observation = row["before_observation"] or row["after_observation"]
+        for restored in (row["action"], observation["payload"]):
+            assert restored["completeness"] == "complete"
+            assert restored["missing"] == {}
 
 
 def test_save_failure_is_logged_without_replacing_execution_error(
