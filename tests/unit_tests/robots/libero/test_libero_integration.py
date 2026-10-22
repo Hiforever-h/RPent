@@ -98,8 +98,11 @@ def _primitives(env, config=None, molmo_client=None, *, capture_actions=False):
     )
 
 
-@pytest.mark.parametrize("mode", ["evaluation", "exploration"])
-def test_actions_follow_api_tool_calls(tmp_path, monkeypatch, mode):
+@pytest.mark.parametrize(
+    ("mode", "record_trajectory"),
+    [("evaluation", True), ("exploration", True), ("evaluation", False)],
+)
+def test_actions_follow_api_tool_calls(tmp_path, monkeypatch, mode, record_trajectory):
     monkeypatch.setattr("rpent.tools.toolkit.substitute", lambda value: value)
     monkeypatch.setattr("rpent.planner.api_loop.substitute", lambda value: value)
     monkeypatch.setattr(
@@ -126,10 +129,11 @@ def test_actions_follow_api_tool_calls(tmp_path, monkeypatch, mode):
         enable_direct_action=True,
         state_output_dir=tmp_path / "state",
     )
-    toolkit.state.start_task(
-        instruction="release, use VLA, then move",
-        config=Payload(format="test", data={}),
-    )
+    if record_trajectory:
+        toolkit.state.start_task(
+            instruction="release, use VLA, then move",
+            config=Payload(format="test", data={}),
+        )
     executed = []
     results = []
 
@@ -202,6 +206,13 @@ def test_actions_follow_api_tool_calls(tmp_path, monkeypatch, mode):
     assert len(executed) == 9
     assert chunk_calls == [True, True]
     actions = toolkit.state.action_records()
+    if not record_trajectory:
+        assert toolkit.state.get_task() is None
+        assert toolkit.state.planner_records() == []
+        assert actions == []
+        assert toolkit.state.prediction_records() == []
+        assert not (tmp_path / "state" / "trajectories").exists()
+        return
     toolkit.state.end_task(status="completed", stop_reason="finish")
     root = toolkit.state.save_planner_trajectory()
     saved = [

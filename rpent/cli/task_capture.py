@@ -35,7 +35,7 @@ def start_api_task(
     toolkit: Toolkit, args: argparse.Namespace, config: RunConfig, instruction: str
 ) -> EnvState | None:
     """Open API capture on this execution's EnvState."""
-    if args.planner != "api":
+    if args.planner != "api" or not args.record_trajectory:
         return None
     state = toolkit.state
     state.start_task(

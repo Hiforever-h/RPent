@@ -194,6 +194,12 @@ def _build_argparser() -> argparse.ArgumentParser:
     # other config
     ap.add_argument("--output-dir", default=None)
     ap.add_argument(
+        "--record-trajectory",
+        action="store_true",
+        help="Record task, planner, and tool trajectories (api planner only). "
+        "Also records actions and VLA predictions in LIBERO evaluation mode.",
+    )
+    ap.add_argument(
         "--memory-profile",
         choices=["hf", "local"],
         default=None,
