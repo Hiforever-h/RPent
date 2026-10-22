@@ -61,11 +61,19 @@ def test_task_end_keeps_partial_records_and_actual_stop_cause(
     observation_id = state.register_observation(payload=Payload("test.obs", [1]))
     action_id = state.register_action(
         tool_call_id=tool_id,
-        source="direct",
+        source="vla",
         action=Payload("test.action", [0.5]),
         before_observation_id=None,
         after_observation_id=observation_id,
         missing={"before_observation_id": MissingInfo("capture_failed", "RPC failed.")},
+    )
+    prediction_id = state.register_prediction(
+        tool_call_id=tool_id,
+        input_observation_id=None,
+        instruction="Move the cup.",
+        actions=Payload("test.actions", [[0.5]]),
+        action_ids=[action_id],
+        missing={"input_observation_id": MissingInfo("capture_failed", "RPC failed.")},
     )
     args.seed = 99
     result = PlannerResult(
@@ -102,6 +110,14 @@ def test_task_end_keeps_partial_records_and_actual_stop_cause(
         saved_action["missing"]["before_observation_id"]["reason"] == "capture_failed"
     )
     assert saved_action["after_observation"]["payload"]["data"] == [1]
+    prediction = json.loads((root / "predictions.jsonl").read_text())
+    assert prediction["prediction_id"] == prediction_id
+    assert (
+        prediction["planner_id"] == planner_id and prediction["tool_call_id"] == tool_id
+    )
+    assert prediction["action_ids"] == [action_id]
+    assert prediction["input_observation"] is None
+    assert prediction["missing"]["input_observation_id"]["reason"] == "capture_failed"
     with pytest.raises(RuntimeError, match="not running"):
         state.update_planner(planner_id, status="failed")
 
@@ -124,7 +140,9 @@ def test_successful_operator_verdict_is_separate_from_planner_error(tmp_path):
     assert json.loads((root / "task.json").read_text())["task"]["status"] == "completed"
 
 
-@pytest.mark.parametrize("attachment", ["planner", "action", "observation"])
+@pytest.mark.parametrize(
+    "attachment", ["planner", "action", "observation", "prediction"]
+)
 def test_task_end_saves_partial_trajectory_after_attachment_failure(
     tmp_path, monkeypatch, attachment
 ):
@@ -156,9 +174,20 @@ def test_task_end_saves_partial_trajectory_after_attachment_failure(
         )
         for index in range(2)
     ]
-    failed_data = {"planner": b"image", "action": np.array([0]), "observation": states}[
-        attachment
-    ]
+    prediction_actions = np.array([[1]])
+    state.register_prediction(
+        tool_call_id=tool_id,
+        input_observation_id=observation_id,
+        instruction="Move.",
+        actions=Payload("test.actions", prediction_actions, completeness="complete"),
+        action_ids=actions[1:],
+    )
+    failed_data = {
+        "planner": b"image",
+        "action": np.array([0]),
+        "observation": states,
+        "prediction": prediction_actions,
+    }[attachment]
     replace = os.replace
 
     def fail_attachment(source, destination):
@@ -192,6 +221,10 @@ def test_task_end_saves_partial_trajectory_after_attachment_failure(
     assert task["result"]["data"]["error"] == "RuntimeError: model failed"
     assert [row["action_id"] for row in rows] == actions
     assert rows[0]["after_observation"] == rows[1]["before_observation"]
+    prediction = json.loads((root / "predictions.jsonl").read_text())
+    assert prediction["action_ids"] == actions[1:]
+    assert prediction["input_observation"] == rows[1]["before_observation"]
+    prediction_payload = prediction["actions"]
     action = rows[0]["action"]
     observation = rows[0]["after_observation"]["payload"]
     payload, pointer, absent = {
@@ -202,6 +235,7 @@ def test_task_end_saves_partial_trajectory_after_attachment_failure(
         ),
         "action": (action, "", action["data"]),
         "observation": (observation, "/states", observation["data"]["states"]),
+        "prediction": (prediction_payload, "", prediction_payload["data"]),
     }[attachment]
     assert absent is None
     assert payload["completeness"] == "partial"
@@ -227,6 +261,11 @@ def test_task_end_saves_partial_trajectory_after_attachment_failure(
         for restored in (row["action"], observation["payload"]):
             assert restored["completeness"] == "complete"
             assert restored["missing"] == {}
+    restored = json.loads((root / "predictions.jsonl").read_text())["actions"]
+    assert restored["completeness"] == "complete" and restored["missing"] == {}
+    np.testing.assert_array_equal(
+        np.load(root / restored["data"]["path"], allow_pickle=False), prediction_actions
+    )
 
 
 def test_save_failure_is_logged_without_replacing_execution_error(

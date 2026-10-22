@@ -24,6 +24,7 @@ from rpent.session.records import (
     ObservationRecord,
     Payload,
     PlannerRecord,
+    PredictionRecord,
     TaskRecord,
     ToolCallRecord,
 )
@@ -38,6 +39,7 @@ __all__ = [
     "ObservationRecord",
     "Payload",
     "PlannerRecord",
+    "PredictionRecord",
     "StepRecord",
     "TaskRecord",
     "ToolCallRecord",

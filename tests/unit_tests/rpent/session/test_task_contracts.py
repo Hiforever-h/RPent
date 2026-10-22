@@ -100,6 +100,7 @@ def test_task_is_explicit_and_cannot_be_overwritten(tmp_path: Path) -> None:
     state = EnvState(tmp_path)
     assert state.get_task() is None
     assert state.planner_records() == state.action_records() == []
+    assert state.prediction_records() == []
     assert state.save("recipe.json", [], step=None) == "recipe.json"
     with state.record_step(state={"ready": True}):
         pass
@@ -120,6 +121,14 @@ def test_task_is_explicit_and_cannot_be_overwritten(tmp_path: Path) -> None:
         )
     with pytest.raises(RuntimeError, match="not running"):
         state.end_task(status="completed", stop_reason="finish")
+    with pytest.raises(RuntimeError, match="not running"):
+        state.register_prediction(
+            tool_call_id="T1",
+            input_observation_id=None,
+            instruction="Move.",
+            actions=Payload("test.actions", []),
+            action_ids=[],
+        )
 
     task_id = state.start_task(instruction="Move.", config=Payload("json", {}))
     with pytest.raises(RuntimeError, match="already been started"):
@@ -162,12 +171,20 @@ def test_ended_task_rejects_record_writes(state: EnvState, tool_id: str) -> None
             before_observation_id=None,
             after_observation_id=None,
         ),
+        lambda: state.register_prediction(
+            tool_call_id=tool_id,
+            input_observation_id=None,
+            instruction="Move.",
+            actions=Payload("test.actions", []),
+            action_ids=[],
+        ),
     ]
     for write in writes:
         with pytest.raises(RuntimeError, match="not running"):
             write()
     assert state.planner_records() == planners
     assert state.action_records() == []
+    assert state.prediction_records() == []
 
 
 def test_planner_update_preserves_request_tools_and_registration_order(
@@ -542,6 +559,26 @@ def test_model_and_action_trajectories_share_explicit_links(state: EnvState) -> 
     assert actions[2].missing["after_observation_id"].reason == "capture_failed"
 
 
+def test_payload_keeps_native_data_without_copying_or_coercing():
+    values = np.array([0.1, 0.2], dtype=np.float32)
+    data = {
+        "values": values,
+        "image": bytes([0, 255]),
+        "references": [
+            ArtifactRef("artifacts/image.bin", "bytes"),
+            DataRef("observation", "O1", "/payload/data/image"),
+        ],
+    }
+    payload = Payload("test.native", data)
+
+    assert payload.data is data
+    assert payload.data["values"] is values
+    values[0] = 0.5
+    data["references"].clear()
+    assert payload.data["values"][0] == 0.5
+    assert payload.data["references"] == []
+
+
 def test_registration_and_queries_isolate_nested_payloads(tmp_path: Path) -> None:
     state = EnvState(tmp_path)
     config = Payload("test.config", {"model": {"max_tokens": 1024}})
@@ -578,7 +615,21 @@ def test_registration_and_queries_isolate_nested_payloads(tmp_path: Path) -> Non
         after_observation_id=None,
         result=Payload("test.result", DataRef("tool_call", tool, "/raw_result/data")),
     )
+    action_ids = [action]
+    prediction_missing = {
+        "input_observation_id": MissingInfo("capture_failed", "Camera failed.")
+    }
+    state.register_prediction(
+        tool_call_id=tool,
+        input_observation_id=None,
+        instruction="Move the cup.",
+        actions=Payload("test.actions", values[None, :], inline_array_paths=("",)),
+        action_ids=action_ids,
+        missing=prediction_missing,
+    )
 
+    action_ids.clear()
+    prediction_missing["input_observation_id"].detail = "Changed"
     config.data["model"]["max_tokens"] = 1
     request.data["messages"].clear()
     source_ids.clear()
@@ -601,6 +652,23 @@ def test_registration_and_queries_isolate_nested_payloads(tmp_path: Path) -> Non
     actions[0].action.missing.clear()
     actions[0].action.data["joints"][:] = 66
     actions.clear()
+    prediction = state.prediction_records()[0]
+    prediction.actions.data[:] = 55
+    prediction.action_ids.clear()
+    prediction.missing.clear()
+    stored_prediction = state.prediction_records()[0]
+    assert (
+        stored_prediction.planner_id == planner
+        and stored_prediction.tool_call_id == tool
+    )
+    assert stored_prediction.instruction == "Move the cup."
+    assert stored_prediction.input_observation_id is None
+    assert stored_prediction.actions.inline_array_paths == ("",)
+    assert stored_prediction.action_ids == [action]
+    assert stored_prediction.missing["input_observation_id"].detail == "Camera failed."
+    np.testing.assert_array_equal(
+        stored_prediction.actions.data, np.array([[0.1, 0.2]], dtype=np.float32)
+    )
 
     assert state.get_task().config.data == {"model": {"max_tokens": 1024}}
     assert state.get_planner(planner).request.data["messages"][0]["content"] == "Move."
@@ -631,7 +699,7 @@ def test_registration_and_queries_isolate_nested_payloads(tmp_path: Path) -> Non
 def test_interleaved_registration_keeps_ids_and_parent_links(state: EnvState) -> None:
     planners = [state.register_planner(backend="api") for _ in range(2)]
 
-    def register(index: int) -> tuple[str, str, str]:
+    def register(index: int) -> tuple[str, str, str, str]:
         tool = state.register_tool_call(
             planner_id=planners[index % 2],
             name="move",
@@ -642,21 +710,32 @@ def test_interleaved_registration_keeps_ids_and_parent_links(state: EnvState) ->
         )
         action = state.register_action(
             tool_call_id=tool,
-            source="direct",
+            source="vla",
             action=Payload("test.action", [index]),
             before_observation_id=observation,
             after_observation_id=None,
         )
-        return tool, observation, action
+        prediction = state.register_prediction(
+            tool_call_id=tool,
+            input_observation_id=observation,
+            instruction="Move.",
+            actions=Payload("test.actions", [[index]]),
+            action_ids=[action],
+        )
+        return tool, observation, action, prediction
 
     with ThreadPoolExecutor(max_workers=8) as pool:
         identities = list(pool.map(register, range(32)))
 
-    assert len({identity for group in identities for identity in group}) == 96
+    assert len({identity for group in identities for identity in group}) == 128
     assert [action.action_id for action in state.action_records()] == [
         f"A{index}" for index in range(1, 33)
     ]
-    for index, (tool, observation, action) in enumerate(identities):
+    predictions = {
+        record.prediction_id: record for record in state.prediction_records()
+    }
+    assert list(predictions) == [f"V{index}" for index in range(1, 33)]
+    for index, (tool, observation, action, prediction) in enumerate(identities):
         assert state.get_tool_call(tool).planner_id == planners[index % 2]
         assert state.get_tool_call(tool).arguments.data == {"index": index}
         assert state.get_action(action).tool_call_id == tool
@@ -664,6 +743,11 @@ def test_interleaved_registration_keeps_ids_and_parent_links(state: EnvState) ->
         assert state.get_action(action).action.format == "test.action"
         assert state.get_action(action).action.data == [index]
         assert state.get_observation(observation).payload.data == index
+        assert predictions[prediction].planner_id == planners[index % 2]
+        assert predictions[prediction].tool_call_id == tool
+        assert predictions[prediction].input_observation_id == observation
+        assert predictions[prediction].action_ids == [action]
+        assert predictions[prediction].actions.data == [[index]]
     for index, planner in enumerate(state.planner_records()):
         assert sorted(
             call.arguments.data["index"] for call in planner.tool_calls
@@ -748,6 +832,39 @@ def test_unknown_parents_do_not_publish_child_records(state: EnvState) -> None:
     ]:
         with pytest.raises(KeyError):
             get("unknown")
+
+
+@pytest.mark.parametrize("invalid", ["tool", "action", "owner"])
+def test_prediction_rejects_invalid_action_links(
+    state: EnvState, tool_id: str, invalid: str
+) -> None:
+    action_id = state.register_action(
+        tool_call_id=tool_id,
+        source="vla",
+        action=Payload("test.action", [1]),
+        before_observation_id=None,
+        after_observation_id=None,
+    )
+    if invalid == "tool":
+        tool_id = "unknown-tool"
+    elif invalid == "action":
+        action_id = "unknown-action"
+    else:
+        tool_id = state.register_tool_call(
+            planner_id=state.get_tool_call(tool_id).planner_id,
+            name="other",
+            arguments=Payload("json", {}),
+        )
+
+    with pytest.raises(ValueError if invalid == "owner" else KeyError):
+        state.register_prediction(
+            tool_call_id=tool_id,
+            input_observation_id=None,
+            instruction="Move.",
+            actions=Payload("test.actions", [[1]]),
+            action_ids=[action_id],
+        )
+    assert state.prediction_records() == []
 
 
 def test_one_tool_keeps_mixed_action_protocols_in_execution_order(
@@ -869,7 +986,7 @@ def test_planner_trajectory_preserves_records_and_registration_order(
         },
     )
     saved_task = json.loads((root / "task.json").read_text())
-    assert saved_task == {"schema_version": 2, "task": expected[0]}
+    assert saved_task == {"schema_version": 3, "task": expected[0]}
     records = [
         json.loads(line) for line in (root / "planners.jsonl").read_text().splitlines()
     ]
@@ -961,6 +1078,7 @@ def test_planner_trajectory_saves_a_task_without_model_calls(state):
     root = state.save_planner_trajectory()
     assert (root / "planners.jsonl").read_text() == ""
     assert (root / "actions.jsonl").read_text() == ""
+    assert (root / "predictions.jsonl").read_text() == ""
     assert json.loads((root / "task.json").read_text())["task"]["status"] == "failed"
 
 
@@ -1091,7 +1209,9 @@ def test_planner_trajectory_distinguishes_references_and_literal_tags(state):
     assert state.get_planner(planner_id).request.data == payload
 
 
-@pytest.mark.parametrize("filename", ["planners.jsonl", "actions.jsonl", "task.json"])
+@pytest.mark.parametrize(
+    "filename", ["planners.jsonl", "actions.jsonl", "predictions.jsonl", "task.json"]
+)
 def test_planner_trajectory_write_failure_is_visible_and_retryable(
     state, tmp_path, monkeypatch, filename
 ):
@@ -1107,15 +1227,28 @@ def test_planner_trajectory_write_failure_is_visible_and_retryable(
     observation = state.register_observation(
         payload=Payload("test.obs", np.array([0], dtype=np.float32))
     )
-    state.register_action(
+    action_id = state.register_action(
         tool_call_id=tool,
-        source="direct",
+        source="vla",
         action=Payload("test.action", np.array([1], dtype=np.float32)),
         before_observation_id=observation,
         after_observation_id=None,
     )
+    prediction_id = state.register_prediction(
+        tool_call_id=tool,
+        input_observation_id=observation,
+        instruction="Move.",
+        actions=Payload(
+            "test.actions", np.array([[1]], np.float32), inline_array_paths=("",)
+        ),
+        action_ids=[action_id],
+    )
     state.end_task(status="completed", stop_reason="finish")
     root = tmp_path / "trajectories" / state.get_task().task_id
+    root.mkdir(parents=True)
+    destination = root / filename
+    previous = b'{"previous": true}\n'
+    destination.write_bytes(previous)
     replace = os.replace
 
     def fail_replace(source, destination):
@@ -1127,7 +1260,9 @@ def test_planner_trajectory_write_failure_is_visible_and_retryable(
         patch.setattr("rpent.session.base.os.replace", fail_replace)
         with pytest.raises(OSError, match="disk full"):
             state.save_planner_trajectory()
-    assert not (root / "task.json").exists()
+    assert destination.read_bytes() == previous
+    if filename != "task.json":
+        assert not (root / "task.json").exists()
     assert not list(root.rglob(".*.tmp*"))
     assert state.planner_records()[0].request.data == b"request"
 
@@ -1142,6 +1277,11 @@ def test_planner_trajectory_write_failure_is_visible_and_retryable(
     np.testing.assert_array_equal(np.load(root / action["action"]["data"]["path"]), [1])
     reference = action["before_observation"]["payload"]["data"]
     np.testing.assert_array_equal(np.load(root / reference["path"]), [0])
+    prediction = json.loads((root / "predictions.jsonl").read_text())
+    assert prediction["prediction_id"] == prediction_id
+    assert prediction["action_ids"] == [action_id]
+    assert prediction["input_observation"] == action["before_observation"]
+    assert prediction["actions"]["data"]["value"] == [[1]]
     assert len(list((root / "artifacts").iterdir())) == 4
 
 
@@ -1170,6 +1310,20 @@ def test_action_trajectory_embeds_observations_and_reuses_attachments(state, too
             ),
         )
         for index, source in enumerate(sources)
+    ]
+    prediction_ids = [
+        state.register_prediction(
+            tool_call_id=tool_id,
+            input_observation_id=observations[index],
+            instruction="Move.",
+            actions=Payload(
+                "test.actions",
+                np.array([[index]], np.float32),
+                inline_array_paths=("",),
+            ),
+            action_ids=[action_ids[index]],
+        )
+        for index in range(1, len(sources), 3)
     ]
     state.end_task(status="completed", stop_reason="finish")
 
@@ -1211,6 +1365,23 @@ def test_action_trajectory_embeds_observations_and_reuses_attachments(state, too
             )
     for previous, following in zip(rows, rows[1:]):
         assert previous["after_observation"] == following["before_observation"]
+    predictions = [
+        json.loads(line)
+        for line in (root / "predictions.jsonl").read_text().splitlines()
+    ]
+    assert [row["prediction_id"] for row in predictions] == prediction_ids
+    for prediction, action in zip(predictions, rows[1::3]):
+        assert prediction["planner_id"] == planner["planner_id"]
+        assert prediction["tool_call_id"] == tool_id
+        assert prediction["input_observation"] == action["before_observation"]
+        assert prediction["action_ids"] == [action["action_id"]]
+        assert prediction["actions"]["data"] == {
+            "$type": "ndarray",
+            "dtype": "float32",
+            "shape": [1, 1],
+            "value": [[action["result"]["data"]["reward"]]],
+        }
+        assert "inline_array_paths" not in prediction["actions"]
     assert len(list((root / "artifacts").iterdir())) == 13 + 12 + 1
     assert not (root / "observations.jsonl").exists()
     assert isinstance(state.get_action(action_ids[0]).action.data, np.ndarray)
@@ -1245,7 +1416,7 @@ def test_action_trajectory_preserves_missing_observations(state, tool_id):
 
 
 @pytest.mark.parametrize("kind", ["bytes", "ndarray"])
-@pytest.mark.parametrize("owner", ["observation", "action"])
+@pytest.mark.parametrize("owner", ["observation", "action", "prediction"])
 @pytest.mark.parametrize("stem", ["payload-000001", ".payload-000001.tmp"])
 def test_captured_artifacts_survive_trajectory_save(
     state, tool_id, tmp_path, kind, owner, stem
@@ -1270,12 +1441,19 @@ def test_captured_artifacts_survive_trajectory_save(
     observation = state.register_observation(
         payload=Payload("test.obs", reference if owner == "observation" else {})
     )
-    state.register_action(
+    action_id = state.register_action(
         tool_call_id=tool_id,
         source="vla",
         action=Payload("test.action", reference if owner == "action" else [1]),
         before_observation_id=observation,
         after_observation_id=observation,
+    )
+    state.register_prediction(
+        tool_call_id=tool_id,
+        input_observation_id=observation,
+        instruction="Move.",
+        actions=Payload("test.actions", reference if owner == "prediction" else [[1]]),
+        action_ids=[action_id],
     )
     state.register_planner(
         backend="api",
@@ -1287,11 +1465,12 @@ def test_captured_artifacts_survive_trajectory_save(
     state.save_planner_trajectory()
 
     row = json.loads((root / "actions.jsonl").read_text())
-    payload = (
-        row["before_observation"]["payload"]
-        if owner == "observation"
-        else row["action"]
-    )
+    prediction = json.loads((root / "predictions.jsonl").read_text())
+    payload = {
+        "observation": row["before_observation"]["payload"],
+        "action": row["action"],
+        "prediction": prediction["actions"],
+    }[owner]
     assert payload["data"] == {
         "$type": "artifact_ref",
         **json.loads(json.dumps(asdict(reference))),

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Data contracts for tasks, planner calls, observations, and executed actions.
+"""Data contracts for tasks, planner calls, observations, actions, and predictions.
 
 ``missing`` keys are record field names or JSON Pointers into payload data.
 Timestamps are timezone-aware. These containers do not copy nested data.
@@ -172,4 +172,18 @@ class ActionRecord:
     after_observation_id: str | None
     executed_at: datetime | None = None
     result: Payload | None = None
+    missing: dict[str, MissingInfo] = field(default_factory=dict)
+
+
+@dataclass
+class PredictionRecord:
+    """Confirmed executed actions from one VLA prediction."""
+
+    prediction_id: str
+    planner_id: str | None
+    tool_call_id: str
+    input_observation_id: str | None
+    instruction: str
+    actions: Payload
+    action_ids: list[str]  # Same order as actions.data.
     missing: dict[str, MissingInfo] = field(default_factory=dict)

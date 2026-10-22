@@ -207,9 +207,15 @@ def test_actions_follow_api_tool_calls(tmp_path, monkeypatch, mode):
     saved = [
         json.loads(line) for line in (root / "actions.jsonl").read_text().splitlines()
     ]
+    saved_predictions = [
+        json.loads(line)
+        for line in (root / "predictions.jsonl").read_text().splitlines()
+    ]
     if mode == "exploration":
         assert actions == []
         assert saved == []
+        assert toolkit.state.prediction_records() == []
+        assert saved_predictions == []
         return
 
     assert [row["action_id"] for row in saved] == [
@@ -303,6 +309,26 @@ def test_actions_follow_api_tool_calls(tmp_path, monkeypatch, mode):
     assert vla_call.model_config.missing["/server_config"].reason == "not_exposed"
     assert "effective_instruction" not in vla_call.missing
     assert "model_config" not in vla_call.missing
+
+    assert len(saved_predictions) == 2
+    for row, group in zip(saved_predictions, (actions[2:4], actions[4:6])):
+        assert row["planner_id"] == vla_call.planner_id
+        assert row["tool_call_id"] == vla_call.tool_call_id
+        assert row["instruction"] == "pick up the bowl"
+        assert row["action_ids"] == [action.action_id for action in group]
+        assert (
+            row["input_observation"]["observation_id"]
+            == row["input_observation_id"]
+            == group[0].before_observation_id
+        )
+        assert row["actions"]["format"] == "libero.action_chunk"
+        assert row["actions"]["completeness"] == "complete"
+        assert row["actions"]["data"] == {
+            "$type": "ndarray",
+            "dtype": "float32",
+            "shape": [2, 7],
+            "value": [action.action.data.tolist() for action in group],
+        }
 
     executed[1][:] = 99
     results[1][0]["states"][:] = 99
@@ -492,6 +518,10 @@ def test_attachment_failure_preserves_confirmed_actions(
     assert not list((root / "artifacts").glob(".*.tmp.*"))
     if failed_write == 3:
         assert saved[0]["after_observation"] == saved[1]["before_observation"]
+    if vla:
+        prediction = json.loads((root / "predictions.jsonl").read_text())
+        assert prediction["input_observation"] == saved[0]["before_observation"]
+        assert prediction["action_ids"] == [row["action_id"] for row in saved]
 
 
 @pytest.mark.parametrize("frame_failure", [False, True])
@@ -503,6 +533,11 @@ def test_vla_capture_keeps_all_confirmed_actions(
     predict = primitives.model.predict
 
     def predict_separately(observation, *, options):
+        assert primitives._observation_id is not None
+        captured = capture.state.get_observation(primitives._observation_id)
+        np.testing.assert_array_equal(
+            captured.payload.data["states"], initial["states"]
+        )
         assert observation is not initial
         assert initial["task_descriptions"] == "put the bowl on the plate"
         assert "extra_view_images" not in initial
@@ -533,6 +568,69 @@ def test_vla_capture_keeps_all_confirmed_actions(
     assert call.after_observation_id == actions[-1].after_observation_id
     observation = capture.state.get_observation(call.after_observation_id)
     np.testing.assert_array_equal(observation.payload.data["states"], _obs(3)["states"])
+    (prediction,) = capture.state.prediction_records()
+    assert prediction.input_observation_id == actions[0].before_observation_id
+    assert prediction.action_ids == [action.action_id for action in actions]
+    np.testing.assert_array_equal(prediction.actions.data, np.ones((2, 7), np.float32))
+
+
+@pytest.mark.parametrize(
+    "terminal,step_count", [("terminated", 5), ("truncated", 5), ("terminated", 3)]
+)
+def test_predictions_keep_each_calls_context_and_confirmed_actions(
+    captured_primitives, monkeypatch, terminal, step_count
+):
+    primitives, capture = captured_primitives
+    predicted = np.linspace(-1, 1, 35, dtype=np.float32).reshape(5, 7)
+    chunks = (predicted, -predicted)
+    instructions = ("move toward the bowl", "lift the bowl")
+    flags = {name: np.zeros(step_count, bool) for name in ("terminated", "truncated")}
+    flags[terminal][2] = True
+    predict = Mock(side_effect=chunks)
+    monkeypatch.setattr(primitives.model, "predict", predict)
+    monkeypatch.setattr(
+        primitives.env,
+        "chunk_step",
+        Mock(
+            side_effect=[
+                (
+                    [
+                        _obs(call * step_count + index + 1)
+                        for index in range(step_count)
+                    ],
+                    np.zeros(step_count),
+                    flags["terminated"] if call else np.zeros(step_count, bool),
+                    flags["truncated"] if call else np.zeros(step_count, bool),
+                    [{} for _ in range(step_count)],
+                )
+                for call in range(2)
+            ]
+        ),
+    )
+    with capture.bind():
+        for instruction in instructions:
+            primitives._vlm_chunk(instruction)
+
+    predictions = capture.state.prediction_records()
+    actions = capture.state.action_records()
+    assert len(predictions) == 2 and len(actions) == 2 * step_count
+    for index, prediction in enumerate(predictions):
+        group = actions[index * step_count : (index + 1) * step_count]
+        request = predict.call_args_list[index].args[0]
+        assert (
+            prediction.instruction
+            == request["task_descriptions"]
+            == instructions[index]
+        )
+        assert prediction.input_observation_id == group[0].before_observation_id
+        observation = capture.state.get_observation(prediction.input_observation_id)
+        np.testing.assert_array_equal(
+            observation.payload.data["states"], request["states"]
+        )
+        assert prediction.action_ids == [action.action_id for action in group]
+        np.testing.assert_array_equal(
+            prediction.actions.data, chunks[index][:step_count]
+        )
 
 
 @pytest.mark.parametrize("failure", ["predict", "cancel", "chunk"])
@@ -543,9 +641,11 @@ def test_unexecuted_vla_actions_are_not_recorded(
     primitives, capture = captured_primitives
     if confirmed_prefix:
         with capture.bind():
-            primitives._step_env(np.zeros(7))
+            primitives._vlm_chunk("pick up the bowl")
     confirmed = capture.state.action_records()
+    predictions = capture.state.prediction_records()
     initial = primitives._last_obs
+    execute_chunk = primitives.env.chunk_step
     chunk_step = Mock(side_effect=RuntimeError("chunk"))
     monkeypatch.setattr(primitives.env, "chunk_step", chunk_step)
     if failure == "predict":
@@ -564,6 +664,9 @@ def test_unexecuted_vla_actions_are_not_recorded(
     assert [a.action_id for a in capture.state.action_records()] == [
         a.action_id for a in confirmed
     ]
+    assert [p.prediction_id for p in capture.state.prediction_records()] == [
+        p.prediction_id for p in predictions
+    ]
     assert primitives._last_obs is initial
     assert initial["task_descriptions"] == "put the bowl on the plate"
     assert "extra_view_images" not in initial
@@ -575,16 +678,20 @@ def test_unexecuted_vla_actions_are_not_recorded(
         assert "unconfirmed" in call.missing["after_observation_id"].detail
         next_id = capture.state.register_tool_call(
             planner_id=call.planner_id,
-            name="release",
-            arguments=Payload("json", {"max_steps": 2}),
+            name="pi0_doubled",
+            arguments=Payload("json", {"prompt": "pick up the bowl"}),
         )
+        monkeypatch.setattr(primitives.env, "chunk_step", execute_chunk)
         with ToolCallCapture(capture.state, next_id).bind():
-            primitives.release(max_steps=2)
+            primitives._vlm_chunk("pick up the bowl")
         first, second = capture.state.action_records()[-2:]
         assert first.before_observation_id is None
         assert first.missing["before_observation_id"].reason == "capture_failed"
         assert second.before_observation_id == first.after_observation_id
         assert capture.state.get_tool_call(next_id).before_observation_id is None
+        prediction = capture.state.prediction_records()[-1]
+        assert prediction.input_observation_id is None
+        assert prediction.missing["input_observation_id"].reason == "capture_failed"
     elif confirmed_prefix:
         assert call.after_observation_id == confirmed[-1].after_observation_id
         assert "after_observation_id" not in call.missing

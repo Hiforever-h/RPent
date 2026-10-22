@@ -41,6 +41,7 @@ from rpent.session.records import (
     ObservationRecord,
     Payload,
     PlannerRecord,
+    PredictionRecord,
     TaskRecord,
     ToolCallRecord,
 )
@@ -120,7 +121,8 @@ class EnvState:
         self._tool_calls: dict[str, ToolCallRecord] = {}
         self._observations: dict[str, ObservationRecord] = {}
         self._actions: dict[str, ActionRecord] = {}
-        self._id_counters = dict.fromkeys(("P", "T", "O", "A"), 0)
+        self._predictions: dict[str, PredictionRecord] = {}
+        self._id_counters = dict.fromkeys(("P", "T", "O", "A", "V"), 0)
         self.reset()
 
     # -- private file resolution -----------------------------------------
@@ -219,7 +221,7 @@ class EnvState:
             raise RuntimeError("task is not running")
         return self._task
 
-    def _new_record_id(self, kind: Literal["P", "T", "O", "A"]) -> str:
+    def _new_record_id(self, kind: Literal["P", "T", "O", "A", "V"]) -> str:
         """Allocate an ID while holding the records lock."""
         self._id_counters[kind] += 1
         return f"{kind}{self._id_counters[kind]}"
@@ -364,6 +366,40 @@ class EnvState:
             )
             self._actions[record.action_id] = record
             return record.action_id
+
+    def register_prediction(
+        self,
+        *,
+        tool_call_id: str,
+        input_observation_id: str | None,
+        instruction: str,
+        actions: Payload,
+        action_ids: list[str],
+        missing: dict[str, MissingInfo] | None = None,
+    ) -> str:
+        """Register one VLA prediction with its confirmed executed actions."""
+        with self._records_lock:
+            self._running_task()
+            tool_call = self._tool_calls[tool_call_id]
+            for action_id in action_ids:
+                if self._actions[action_id].tool_call_id != tool_call_id:
+                    raise ValueError(
+                        f"action {action_id!r} does not belong to tool call {tool_call_id!r}"
+                    )
+            record = copy.deepcopy(
+                PredictionRecord(
+                    prediction_id=self._new_record_id("V"),
+                    planner_id=tool_call.planner_id,
+                    tool_call_id=tool_call_id,
+                    input_observation_id=input_observation_id,
+                    instruction=instruction,
+                    actions=actions,
+                    action_ids=action_ids,
+                    missing=missing or {},
+                )
+            )
+            self._predictions[record.prediction_id] = record
+            return record.prediction_id
 
     # -- task record updates --------------------------------------------
 
@@ -520,6 +556,11 @@ class EnvState:
         with self._records_lock:
             return copy.deepcopy(list(self._actions.values()))
 
+    def prediction_records(self) -> list[PredictionRecord]:
+        """Return VLA prediction snapshots in registration order."""
+        with self._records_lock:
+            return copy.deepcopy(list(self._predictions.values()))
+
     # -- trajectory storage ---------------------------------------------
 
     def save_trajectory_artifact(
@@ -585,6 +626,8 @@ class EnvState:
             reserve_artifacts(observation)
         for action in self._actions.values():
             reserve_artifacts(action)
+        for prediction in self._predictions.values():
+            reserve_artifacts(prediction)
 
         def encode(
             value: Any,
@@ -690,28 +733,32 @@ class EnvState:
                 json.dump(encode(planner), file, ensure_ascii=False, allow_nan=False)
                 file.write("\n")
         observations: dict[str, Any] = {}
-        with self._write_trajectory_file(root / "actions.jsonl") as file:
-            for action in self._actions.values():
-                data = encode(action)
-                for side in ("before", "after"):
-                    observation_id = getattr(action, f"{side}_observation_id")
-                    if (
-                        observation_id is not None
-                        and observation_id not in observations
-                    ):
-                        observations[observation_id] = encode(
-                            self._observations[observation_id]
+        for filename, records, sides in (
+            ("actions.jsonl", self._actions.values(), ("before", "after")),
+            ("predictions.jsonl", self._predictions.values(), ("input",)),
+        ):
+            with self._write_trajectory_file(root / filename) as file:
+                for record in records:
+                    data = encode(record)
+                    for side in sides:
+                        observation_id = getattr(record, f"{side}_observation_id")
+                        if (
+                            observation_id is not None
+                            and observation_id not in observations
+                        ):
+                            observations[observation_id] = encode(
+                                self._observations[observation_id]
+                            )
+                        data[f"{side}_observation"] = (
+                            observations[observation_id]
+                            if observation_id is not None
+                            else None
                         )
-                    data[f"{side}_observation"] = (
-                        observations[observation_id]
-                        if observation_id is not None
-                        else None
-                    )
-                json.dump(data, file, ensure_ascii=False, allow_nan=False)
-                file.write("\n")
+                    json.dump(data, file, ensure_ascii=False, allow_nan=False)
+                    file.write("\n")
         with self._write_trajectory_file(root / "task.json") as file:
             json.dump(
-                {"schema_version": 2, "task": encode(self._task)},
+                {"schema_version": 3, "task": encode(self._task)},
                 file,
                 ensure_ascii=False,
                 allow_nan=False,

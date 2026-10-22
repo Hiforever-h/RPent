@@ -181,7 +181,7 @@ class LiberoPrimitives:
         terminated: Any,
         truncated: Any,
         info: Any,
-    ) -> str:
+    ) -> tuple[str | None, str]:
         """Record a confirmed action ending at the current observation."""
         after_id = self._get_observation_id(capture.state)
         before_missing = (
@@ -192,7 +192,7 @@ class LiberoPrimitives:
             if before_id is None
             else None
         )
-        capture.state.register_action(
+        action_id = capture.state.register_action(
             tool_call_id=capture.tool_call_id,
             source=source,
             action=Payload(
@@ -238,7 +238,7 @@ class LiberoPrimitives:
             after_observation_id=after_id,
             missing=missing,
         )
-        return after_id
+        return after_id, action_id
 
     def _step_env(
         self, action, *, source: Literal["tool_computed", "direct"] = "tool_computed"
@@ -319,11 +319,14 @@ class LiberoPrimitives:
                     missing={"effective_instruction": None, "model_config": None},
                 )
 
+        input_observation_id = (
+            self._get_observation_id(capture.state) if capture else None
+        )
         policy_obs = {**self._last_obs, "task_descriptions": instruction}
         policy_obs.setdefault("extra_view_images", None)
         actions = self.model.predict(policy_obs, options=options)
         self._check_cancelled()
-        before_id = self._get_observation_id(capture.state) if capture else None
+        before_id = input_observation_id
 
         vla_id = (
             self._flywheel.add_proposal(instruction, actions)
@@ -355,9 +358,10 @@ class LiberoPrimitives:
             self.set_obs(chunk_obs[-1] if self.env.return_all_frames else chunk_obs)
         else:
             if capture is not None:
+                action_ids = []
                 for index, obs in enumerate(chunk_obs):
                     self.set_obs(obs)
-                    before_id = self._record_action(
+                    before_id, action_id = self._record_action(
                         capture,
                         actions[index],
                         source="vla",
@@ -366,6 +370,28 @@ class LiberoPrimitives:
                         terminated=terminated[index],
                         truncated=truncated[index],
                         info=infos[index],
+                    )
+                    action_ids.append(action_id)
+                if action_ids:
+                    capture.state.register_prediction(
+                        tool_call_id=capture.tool_call_id,
+                        input_observation_id=input_observation_id,
+                        instruction=instruction,
+                        actions=Payload(
+                            format="libero.action_chunk",
+                            data=actions[: len(action_ids)],
+                            completeness="complete",
+                            inline_array_paths=("",),
+                        ),
+                        action_ids=action_ids,
+                        missing={
+                            "input_observation_id": MissingInfo(
+                                "capture_failed",
+                                "No confirmed input observation after a previous environment call failed.",
+                            )
+                        }
+                        if input_observation_id is None
+                        else None,
                     )
             else:
                 self.set_obs(chunk_obs[-1])
