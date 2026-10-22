@@ -859,20 +859,21 @@ def test_planner_trajectory_preserves_records_and_registration_order(
 
     task = state.get_task()
     assert root == tmp_path / "trajectories" / task.task_id
+    expected = json.loads(
+        json.dumps(
+            [asdict(task), *map(asdict, state.planner_records())],
+            default=datetime.isoformat,
+        ),
+        object_hook=lambda data: {
+            key: value for key, value in data.items() if key != "inline_array_paths"
+        },
+    )
     saved_task = json.loads((root / "task.json").read_text())
-    assert saved_task == {
-        "schema_version": 1,
-        "task": json.loads(json.dumps(asdict(task), default=datetime.isoformat)),
-    }
+    assert saved_task == {"schema_version": 2, "task": expected[0]}
     records = [
         json.loads(line) for line in (root / "planners.jsonl").read_text().splitlines()
     ]
-    assert records == json.loads(
-        json.dumps(
-            [asdict(record) for record in state.planner_records()],
-            default=datetime.isoformat,
-        )
-    )
+    assert records == expected[1:]
     assert [record["planner_id"] for record in records[:-1]] == planner_ids
     assert [tool["tool_call_id"] for tool in records[0]["tool_calls"]] == tool_ids
     assert records[-1]["response"] is None
@@ -1005,17 +1006,64 @@ def test_planner_trajectory_preserves_referenced_attachment_paths(
     } == files
 
 
+@pytest.mark.parametrize(
+    "dtype,values,expected",
+    [
+        ("bool", [True], [True]),
+        ("int32", [3], [3]),
+        (
+            "float32",
+            [np.nan, np.inf, -np.inf],
+            [{"$type": "float", "value": value} for value in ("nan", "inf", "-inf")],
+        ),
+    ],
+)
+def test_trajectory_inlines_only_declared_array_paths(state, dtype, values, expected):
+    native = np.array(values, dtype=dtype)
+    planner_id = state.register_planner(
+        backend="api",
+        request=Payload(
+            "test.request",
+            {"nested/~": [native, None], "attachment": native},
+            inline_array_paths=("/nested~1~0/0", "/nested~1~0/1", "/absent"),
+        ),
+    )
+    state.end_task(status="completed", stop_reason="finish")
+    root = state.save_planner_trajectory()
+    payload = json.loads((root / "planners.jsonl").read_text())["request"]
+    assert "inline_array_paths" not in payload
+    assert payload["data"]["nested/~"] == [
+        {"$type": "ndarray", "dtype": dtype, "shape": [len(values)], "value": expected},
+        None,
+    ]
+    np.testing.assert_array_equal(
+        np.load(root / payload["data"]["attachment"]["path"], allow_pickle=False),
+        native,
+    )
+    assert len(list((root / "artifacts").iterdir())) == 1
+    stored = state.get_planner(planner_id).request.data["nested/~"][0]
+    np.testing.assert_array_equal(stored, native)
+    assert stored.dtype == native.dtype
+
+
 def test_planner_trajectory_distinguishes_references_and_literal_tags(state):
     reference = DataRef("tool_call", "T1", "/raw_result/data")
     artifact = ArtifactRef("artifacts/existing.bin", "bytes")
     literal = {"$type": "data_ref", **asdict(reference)}
     literal_artifact = {"$type": "artifact_ref", **asdict(artifact)}
     literal_float = {"$type": "float", "value": "nan"}
+    literal_array = {"$type": "ndarray", "dtype": "bool", "shape": [1], "value": [True]}
     literal_dict = {"$type": "dict", "value": literal}
     payload = {
         "reference": reference,
         "artifact": artifact,
-        "literals": [literal, literal_artifact, literal_float, literal_dict],
+        "literals": [
+            literal,
+            literal_artifact,
+            literal_float,
+            literal_array,
+            literal_dict,
+        ],
     }
     planner_id = state.register_planner(
         backend="api", request=Payload("test.request", payload)
@@ -1031,6 +1079,7 @@ def test_planner_trajectory_distinguishes_references_and_literal_tags(state):
         {"$type": "dict", "value": literal},
         {"$type": "dict", "value": literal_artifact},
         {"$type": "dict", "value": literal_float},
+        {"$type": "dict", "value": literal_array},
         {
             "$type": "dict",
             "value": {

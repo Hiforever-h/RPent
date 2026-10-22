@@ -591,10 +591,18 @@ class EnvState:
             *,
             missing: dict[str, MissingInfo] | None = None,
             pointer: str = "",
+            inline_array_paths: tuple[str, ...] = (),
         ) -> Any:
             nonlocal attachment_count
             if isinstance(value, np.generic):
                 value = value.item()
+            if isinstance(value, np.ndarray) and pointer in inline_array_paths:
+                return {
+                    "$type": "ndarray",
+                    "dtype": str(value.dtype),
+                    "shape": list(value.shape),
+                    "value": encode(value.tolist(), missing=missing, pointer=pointer),
+                }
             if isinstance(value, (np.ndarray, bytes)):
                 is_bytes = isinstance(value, bytes)
                 digest = sha256(value).hexdigest() if is_bytes else None
@@ -625,13 +633,20 @@ class EnvState:
                 if digest is not None:
                     byte_artifacts[digest] = value
             if is_dataclass(value):
-                failures = {} if isinstance(value, Payload) else None
+                is_payload = isinstance(value, Payload)
+                failures = {} if is_payload else None
                 data = {
                     item.name: encode(
                         getattr(value, item.name),
                         missing=failures if item.name == "data" else None,
+                        inline_array_paths=(
+                            value.inline_array_paths
+                            if is_payload and item.name == "data"
+                            else ()
+                        ),
                     )
                     for item in fields(value)
+                    if not (is_payload and item.name == "inline_array_paths")
                 }
                 if failures:
                     data["missing"].update(encode(failures))
@@ -647,13 +662,19 @@ class EnvState:
                         item,
                         missing=missing,
                         pointer=f"{pointer}/{key.replace('~', '~0').replace('/', '~1')}",
+                        inline_array_paths=inline_array_paths,
                     )
                     for key, item in value.items()
                 }
                 return {"$type": "dict", "value": data} if "$type" in value else data
             if isinstance(value, (list, tuple)):
                 return [
-                    encode(item, missing=missing, pointer=f"{pointer}/{index}")
+                    encode(
+                        item,
+                        missing=missing,
+                        pointer=f"{pointer}/{index}",
+                        inline_array_paths=inline_array_paths,
+                    )
                     for index, item in enumerate(value)
                 ]
             if isinstance(value, float) and not math.isfinite(value):
@@ -690,7 +711,7 @@ class EnvState:
                 file.write("\n")
         with self._write_trajectory_file(root / "task.json") as file:
             json.dump(
-                {"schema_version": 1, "task": encode(self._task)},
+                {"schema_version": 2, "task": encode(self._task)},
                 file,
                 ensure_ascii=False,
                 allow_nan=False,

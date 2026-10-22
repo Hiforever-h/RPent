@@ -83,6 +83,8 @@ class Payload:
     # Completeness is relative to this format's capture boundary.
     completeness: Literal["complete", "partial", "unknown"] = "unknown"
     missing: dict[str, MissingInfo] = field(default_factory=dict)
+    # JSON Pointers into data; this storage hint is omitted from saved records.
+    inline_array_paths: tuple[str, ...] = ()
 
 
 @dataclass

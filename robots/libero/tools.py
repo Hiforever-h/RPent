@@ -164,6 +164,7 @@ class LiberoPrimitives:
                     data=data,
                     completeness="partial" if missing else "complete",
                     missing=missing,
+                    inline_array_paths=("/states",),
                 ),
                 captured_at=datetime.now(timezone.utc),
             )
@@ -195,7 +196,10 @@ class LiberoPrimitives:
             tool_call_id=capture.tool_call_id,
             source=source,
             action=Payload(
-                format="libero.action", data=action, completeness="complete"
+                format="libero.action",
+                data=action,
+                completeness="complete",
+                inline_array_paths=("",),
             ),
             before_observation_id=before_id,
             after_observation_id=after_id,
@@ -208,6 +212,12 @@ class LiberoPrimitives:
                     "info": info,
                 },
                 completeness="complete",
+                inline_array_paths=(
+                    "/info/episode/success_once",
+                    "/info/episode/return",
+                    "/info/episode/episode_len",
+                    "/info/episode/reward",
+                ),
             ),
             missing={
                 "executed_at": MissingInfo(

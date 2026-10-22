@@ -140,7 +140,16 @@ def test_actions_follow_api_tool_calls(tmp_path, monkeypatch, mode):
             np.float32(0.5),
             np.bool_(False),
             np.bool_(False),
-            {"step": np.int64(len(executed))},
+            {
+                "step": np.int64(len(executed)),
+                "custom_stat": np.array([42], np.int32),
+                "episode": {
+                    "success_once": np.array([False]),
+                    "return": np.array([0.5 * len(executed)], np.float32),
+                    "episode_len": np.array([len(executed)], np.int32),
+                    "reward": np.array([0.5], np.float32),
+                },
+            },
         )
         results.append(result)
         return result
@@ -225,6 +234,8 @@ def test_actions_follow_api_tool_calls(tmp_path, monkeypatch, mode):
     for previous, current in zip(actions, actions[1:]):
         assert previous.after_observation_id == current.before_observation_id
     for index, action in enumerate(actions, start=1):
+        row = saved[index - 1]
+        inline = [(row["action"]["data"], action.action.data)]
         np.testing.assert_array_equal(action.action.data, executed[index])
         assert action.action.data.dtype == executed[index].dtype
         assert action.result.data == dict(
@@ -233,16 +244,37 @@ def test_actions_follow_api_tool_calls(tmp_path, monkeypatch, mode):
         assert isinstance(action.result.data["reward"], np.float32)
         assert action.executed_at is None
         assert action.missing["executed_at"].reason == "not_exposed"
-        for observation_id, value in (
-            (action.before_observation_id, index),
-            (action.after_observation_id, index + 1),
+        for side, observation_id, value in (
+            ("before", action.before_observation_id, index),
+            ("after", action.after_observation_id, index + 1),
         ):
             observation = toolkit.state.get_observation(observation_id)
+            inline.append(
+                (
+                    row[f"{side}_observation"]["payload"]["data"]["states"],
+                    observation.payload.data["states"],
+                )
+            )
             for key, expected in _obs(value).items():
                 stored = observation.payload.data[key]
                 if isinstance(stored, ArtifactRef):
                     stored = np.load(root / stored.path, allow_pickle=False)
                 np.testing.assert_array_equal(stored, expected)
+        info = row["result"]["data"]["info"]
+        inline.extend(
+            (info["episode"][key], value)
+            for key, value in action.result.data["info"]["episode"].items()
+        )
+        for encoded, native in inline:
+            assert encoded == {
+                "$type": "ndarray",
+                "dtype": str(native.dtype),
+                "shape": list(native.shape),
+                "value": native.tolist(),
+            }
+        np.testing.assert_array_equal(
+            np.load(root / info["custom_stat"]["path"], allow_pickle=False), [42]
+        )
 
     tool_calls = [
         toolkit.state.get_tool_call(group[0].tool_call_id)
