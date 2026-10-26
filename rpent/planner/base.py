@@ -96,7 +96,12 @@ async def execute_tool(toolkit: Toolkit, name: str, arguments: dict) -> ToolResu
 
 
 class PlannerResult:
-    """Result returned by a planner invocation."""
+    """Result returned by a planner invocation.
+
+    ``stop_reason`` optionally describes why planning ended, independently
+    of environment success. For example, reaching a request limit can stop
+    planning without setting ``error``.
+    """
 
     __slots__ = ("finish_result", "messages", "stats", "error", "stop_reason")
 

@@ -34,8 +34,8 @@ jobs:
         run: uv pip install --system -e ".[test]"
       - name: Install calibration test dependencies
         run: uv pip install --system "opencv-python-headless==4.10.0.84"
-      - name: Install Flywheel export dependencies
-        run: uv pip install --system -e ".[flywheel]" --torch-backend cpu
+      - name: Install dataset export dependencies
+        run: uv pip install --system -e ".[data,flywheel]" --torch-backend cpu
       - name: Run unit tests with coverage
         run: coverage run --source=rpent,robots -m pytest tests/unit_tests -v
       - name: Generate coverage report

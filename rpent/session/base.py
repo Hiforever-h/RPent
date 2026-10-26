@@ -180,7 +180,10 @@ class EnvState:
     # -- task lifecycle -------------------------------------------------
 
     def start_task(self, *, instruction: str, config: Payload) -> str:
-        """Start this store's single task and return its ID."""
+        """Start this store's single task and return its ID.
+
+        A new task needs a new EnvState; reset() does not clear task records.
+        """
         with self._records_lock:
             if self._task is not None:
                 raise RuntimeError("a task has already been started")
@@ -597,7 +600,15 @@ class EnvState:
         )
 
     def save_planner_trajectory(self) -> Path:
-        """Save ended-task records, marking failed attachments as missing."""
+        """Save task, planner, action, and prediction records after end_task().
+
+        Attachment I/O failures are marked as missing in the saved payload.
+        Record-file write failures propagate to the caller. Each file is
+        replaced after a successful write; the directory is not atomic.
+
+        Returns:
+            The output directory's trajectories/<task_id> subdirectory.
+        """
         if self._task is None or self._task.status == "running":
             raise RuntimeError("end_task() must finish before saving the trajectory")
         root = self._output_dir / "trajectories" / self._task.task_id
