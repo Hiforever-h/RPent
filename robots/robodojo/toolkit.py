@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from rpent.dashboard.events import DashboardEventSink
 from rpent.session import EnvState
+from rpent.session.capture import CapturingEnvClient
 from rpent.tools import Toolkit, ToolResult, iter_tools
 from rpent.utils.logging import get_output_dir
 
@@ -114,7 +115,7 @@ class RoboDojoToolkit(Toolkit):
         self._pending_perception = []
         self._state.reset()
         self._primitives = RoboDojoPrimitives(
-            env=primitives_kwargs["env"],
+            env=CapturingEnvClient(primitives_kwargs["env"], self._state),
             sam3_client=primitives_kwargs.get("sam3_client"),
             vla_client=primitives_kwargs.get("vla_client"),
             action_type=primitives_kwargs.get("action_type", "joint"),

@@ -79,7 +79,7 @@ def iter_samples(
 
 
 def select_vla_segments(trajectory: dict[str, Any]) -> dict[str, list[dict]]:
-    """Return continuous ranges with prediction actions and exclusion reasons."""
+    """Return continuous ranges of executed VLA actions and exclusion reasons."""
     task = trajectory["task"]
     robot = task["config"]["data"]["arguments"].get("robot_name")
     if not isinstance(robot, str) or not robot.isidentifier():
@@ -159,11 +159,13 @@ def select_vla_segments(trajectory: dict[str, Any]) -> dict[str, list[dict]]:
                 )
             ):
                 raise ValueError("Missing prediction data")
-            values = data.read_actions(trajectory["root"], prediction["actions"])
-            if values.ndim != 2 or len(values) != len(action_ids):
-                raise ValueError(
-                    "Prediction actions and action_ids have different lengths"
-                )
+            values = None
+            if trajectory["schema_version"] == 3:
+                values = data.read_actions(trajectory["root"], prediction["actions"])
+                if values.ndim != 2 or len(values) != len(action_ids):
+                    raise ValueError(
+                        "Prediction actions and action_ids have different lengths"
+                    )
             observation = prediction.get("input_observation")
             observation_id = prediction.get("input_observation_id")
             first = positions.get(action_ids[0])
@@ -197,7 +199,7 @@ def select_vla_segments(trajectory: dict[str, Any]) -> dict[str, list[dict]]:
     for prediction, values in sorted(
         predictions, key=lambda item: positions[item[0]["action_ids"][0]]
     ):
-        for action_id, value in zip(prediction["action_ids"], values):
+        for offset, action_id in enumerate(prediction["action_ids"]):
             index = positions.get(action_id)
             reason = None
             if index is None:
@@ -242,8 +244,13 @@ def select_vla_segments(trajectory: dict[str, Any]) -> dict[str, list[dict]]:
                         ):
                             data.validate_observation(trajectory["root"], observation)
                     actual = data.read_actions(trajectory["root"], action["action"])
-                    if not np.array_equal(actual, value):
+                    if actual.ndim != 1:
+                        raise ValueError("Expected one executed action")
+                    if values is not None and not np.array_equal(
+                        actual, values[offset]
+                    ):
                         raise ValueError("Executed action differs from its prediction")
+                    value = actual if values is None else values[offset]
                 except (KeyError, TypeError, ValueError, OSError) as exc:
                     reason = f"invalid_action: {exc}"
 

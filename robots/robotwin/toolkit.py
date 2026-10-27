@@ -27,6 +27,7 @@ from robots.robotwin.primitives import RoboTwinPrimitives
 from robots.robotwin.robot_spec import ROBOTWIN_CAMERA_NAMES
 from rpent.dashboard.events import DashboardEventSink
 from rpent.session import EnvState
+from rpent.session.capture import CapturingEnvClient
 from rpent.tools import ToolResult, iter_tools, tool
 from rpent.tools.direct_action import direct_action_tool
 from rpent.tools.toolkit import Toolkit
@@ -113,6 +114,11 @@ class RoboTwinToolkit(Toolkit):
         self._attempt = 1
         self._attempts_per_session = max(0, int(attempts_per_session))
         self._latest_status: dict[str, Any] = {}
+        if self._mode == "evaluation":
+            runtime_kwargs = {
+                **runtime_kwargs,
+                "env": CapturingEnvClient(runtime_kwargs["env"], state),
+            }
         self._primitives = RoboTwinPrimitives(
             check_cancelled=self.raise_if_cancelled,
             **runtime_kwargs,

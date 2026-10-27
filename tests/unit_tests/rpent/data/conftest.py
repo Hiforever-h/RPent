@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+
 import numpy as np
 import pytest
 
-from rpent.data.reader import iter_trajectories
+from rpent.data.reader import iter_trajectories, read_array
 from rpent.session import EnvState, MissingInfo, Payload
 
 
@@ -89,12 +91,6 @@ def trajectory(tmp_path, request):
             tool_call_id=tools[1],
             input_observation_id=observations[start],
             instruction="pick up the bowl",
-            actions=Payload(
-                "libero.action_chunk",
-                values[start:stop],
-                completeness="complete",
-                inline_array_paths=("",),
-            ),
             action_ids=actions[start:stop],
         )
     state.end_task(
@@ -103,3 +99,34 @@ def trajectory(tmp_path, request):
         result=Payload("libero.result", {"environment_success": True}),
     )
     return next(iter_trajectories(state.save_planner_trajectory()))
+
+
+@pytest.fixture
+def legacy_trajectory(trajectory):
+    root = trajectory["root"]
+    actions = {row["action_id"]: row for row in trajectory["actions"]}
+    for prediction in trajectory["predictions"]:
+        values = np.stack(
+            [
+                read_array(root, actions[action_id]["action"]["data"])
+                for action_id in prediction["action_ids"]
+            ]
+        )
+        prediction["actions"] = {
+            "format": "libero.action_chunk",
+            "completeness": "complete",
+            "data": {
+                "$type": "ndarray",
+                "dtype": str(values.dtype),
+                "shape": list(values.shape),
+                "value": values.tolist(),
+            },
+        }
+    task_path = root / "task.json"
+    task = json.loads(task_path.read_text())
+    task["schema_version"] = 3
+    task_path.write_text(json.dumps(task))
+    (root / "predictions.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in trajectory["predictions"])
+    )
+    return next(iter_trajectories(root))

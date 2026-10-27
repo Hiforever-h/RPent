@@ -347,13 +347,23 @@ class EnvState:
         after_observation_id: str | None,
         executed_at: datetime | None = None,
         result: Payload | None = None,
+        prediction_id: str | None = None,
         missing: dict[str, MissingInfo] | None = None,
     ) -> str:
-        """Register a confirmed action in execution order."""
+        """Register a confirmed action and link it to its VLA prediction, if given."""
         with self._records_lock:
             self._running_task()
             if tool_call_id not in self._tool_calls:
                 raise KeyError(tool_call_id)
+            prediction = (
+                self._predictions[prediction_id] if prediction_id is not None else None
+            )
+            if prediction is not None and (
+                source != "vla" or prediction.tool_call_id != tool_call_id
+            ):
+                raise ValueError(
+                    "prediction requires a VLA action from the same tool call"
+                )
             record = copy.deepcopy(
                 ActionRecord(
                     action_id=self._new_record_id("A"),
@@ -368,6 +378,8 @@ class EnvState:
                 )
             )
             self._actions[record.action_id] = record
+            if prediction is not None:
+                prediction.action_ids.append(record.action_id)
             return record.action_id
 
     def register_prediction(
@@ -376,14 +388,14 @@ class EnvState:
         tool_call_id: str,
         input_observation_id: str | None,
         instruction: str,
-        actions: Payload,
-        action_ids: list[str],
+        action_ids: list[str] | None = None,
         missing: dict[str, MissingInfo] | None = None,
     ) -> str:
-        """Register one VLA prediction with its confirmed executed actions."""
+        """Register a VLA prediction, optionally linking already executed actions."""
         with self._records_lock:
             self._running_task()
             tool_call = self._tool_calls[tool_call_id]
+            action_ids = action_ids or []
             for action_id in action_ids:
                 if self._actions[action_id].tool_call_id != tool_call_id:
                     raise ValueError(
@@ -396,7 +408,6 @@ class EnvState:
                     tool_call_id=tool_call_id,
                     input_observation_id=input_observation_id,
                     instruction=instruction,
-                    actions=actions,
                     action_ids=action_ids,
                     missing=missing or {},
                 )
@@ -769,7 +780,7 @@ class EnvState:
                     file.write("\n")
         with self._write_trajectory_file(root / "task.json") as file:
             json.dump(
-                {"schema_version": 3, "task": encode(self._task)},
+                {"schema_version": 4, "task": encode(self._task)},
                 file,
                 ensure_ascii=False,
                 allow_nan=False,

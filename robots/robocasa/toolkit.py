@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any
 from robots.robocasa import tools as robocasa_tools
 from rpent.dashboard.events import DashboardEventSink
 from rpent.session import EnvState
+from rpent.session.capture import CapturingEnvClient
 from rpent.tools import ToolResult, iter_tools
 from rpent.tools.direct_action import direct_action_tool
 from rpent.tools.toolkit import Toolkit
@@ -190,6 +191,11 @@ class RoboCasaToolkit(Toolkit):
 
         from robots.robocasa.primitives import RoboCasaPrimitives
 
+        runtime_kwargs = dict(runtime_kwargs)
+        if self._mode == "evaluation":
+            runtime_kwargs["env_client"] = CapturingEnvClient(
+                runtime_kwargs["env_client"], self._state
+            )
         primitives = RoboCasaPrimitives(
             check_cancelled=self.raise_if_cancelled,
             **runtime_kwargs,

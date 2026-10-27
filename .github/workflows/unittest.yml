@@ -35,7 +35,7 @@ jobs:
       - name: Install calibration test dependencies
         run: uv pip install --system "opencv-python-headless==4.10.0.84"
       - name: Install dataset export dependencies
-        run: uv pip install --system -e ".[data,flywheel]" --torch-backend cpu
+        run: uv pip install --system -e ".[data]" --torch-backend cpu
       - name: Run unit tests with coverage
         run: coverage run --source=rpent,robots -m pytest tests/unit_tests -v
       - name: Generate coverage report

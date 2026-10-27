@@ -75,47 +75,48 @@ class BaseEnvClient:
         )
         return self.last_obs
 
-    def step(self, flat_action):
-        """Execute one env action. Returns the gym 5-tuple
-        ``(obs, rew, term, trunc, info)``.
-
-        Also updates the ``self.last_obs`` cache with the first element (obs)
-        of the returned tuple.
-        """
-        result = self._client.call(
+    def step(self, flat_action: Any, *, capture: bool = False) -> Any:
+        """Execute one action; capture returns :meth:`BaseEnvFacade.step`'s details."""
+        response = self._client.call(
             "env.step",
             args=(flat_action,),
+            kwargs={"capture": True} if capture else None,
             timeout_s=self._TIMEOUT_S["env.step"],
         )
+        result = response["result"] if capture else response
         self.last_obs = result[0]
-        return result
+        return response
 
-    def chunk_step(self, flat_actions, *, return_all_frames: bool = False):
-        """Execute N actions in one batch. Returns the 5-tuple
-        ``(obs, rew, term, trunc, info)``.
+    def chunk_step(
+        self,
+        flat_actions: Any,
+        *,
+        return_all_frames: bool = False,
+        capture: bool = False,
+    ) -> Any:
+        """Execute an action batch and cache its final observation.
 
-        - ``obs_or_list``: ``list[Obs]`` when ``return_all_frames=True`` (one
-          per step, carrying the per-step render); the final obs dict when
-          ``False``.
-        - Updates the ``self.last_obs`` cache: if the returned obs is a list,
-          take the last element; otherwise assign directly.
-
-        ``return_all_frames`` is the standard perf-vs-video switch. ``True``
-        renders agentview per step (high-density video); ``False`` renders only
-        the final obs (fast).
+        ``return_all_frames`` selects per-step observations or the final
+        observation in the original result. ``capture=True`` adds execution
+        details as defined by :meth:`BaseEnvFacade.step`, independently of
+        ``return_all_frames``. ``last_obs`` comes from the original result.
         """
-        result = self._client.call(
+        kwargs = {"return_all_frames": return_all_frames}
+        if capture:
+            kwargs["capture"] = True
+        response = self._client.call(
             "env.chunk_step",
             args=(flat_actions,),
-            kwargs={"return_all_frames": return_all_frames},
+            kwargs=kwargs,
             timeout_s=self._TIMEOUT_S["env.chunk_step"],
         )
+        result = response["result"] if capture else response
         obs_field = result[0]
         if isinstance(obs_field, list):
             self.last_obs = obs_field[-1]
         else:
             self.last_obs = obs_field
-        return result
+        return response
 
     def get_camera_meta(self, camera_name, **kwargs):
         return self._client.call(

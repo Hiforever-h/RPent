@@ -20,17 +20,15 @@ import numpy as np
 import pytest
 from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 
-from robots.libero import robot_spec
 from robots.libero import toolkit as libero_toolkit
-from robots.libero.flywheel import LIBERO_SPEC
+from robots.libero.env_server import LiberoEnvFacade
 from robots.libero.tools import LiberoPrimitives
 from rpent.dashboard.events import NullDashboardEventSink
-from rpent.flywheel.episode import validate_episode
 from rpent.memory import MemoryManager
 from rpent.planner.api_loop import ApiAgentLoop
 from rpent.robots.components.action_spec import validate_action
 from rpent.session import ArtifactRef, EnvState, Payload
-from rpent.session.capture import ToolCallCapture
+from rpent.session.capture import CapturingEnvClient, ToolCallCapture
 from rpent.tools import ToolResult
 from rpent.tools.toolkit import ToolCancelled
 
@@ -52,19 +50,20 @@ class _Env:
         self.truncated = False
         self.return_all_frames = False
         self.chunk_return_all_frames = None
+        self.last_obs = _obs(0)
 
     def reset(self):
-        return _obs(0), {}
+        self.last_obs = _obs(0)
+        return self.last_obs, {}
 
-    def step(self, action):
+    def _step(self, action):
         del action
         return _obs(1), 0, False, False, {}
 
     def validate_action(self, values):
         return validate_action(values, self.action_specs["default"])
 
-    def chunk_step(self, actions, *, return_all_frames=None):
-        self.chunk_return_all_frames = return_all_frames
+    def _chunk_step(self, actions, *, return_all_frames=None):
         observations = [_obs(index + 2) for index in range(len(actions))]
         result = observations if return_all_frames else observations[-1]
         terminated = np.zeros(len(actions), np.bool_)
@@ -78,6 +77,35 @@ class _Env:
             [{} for _ in actions],
         )
 
+    def step(self, action, *, capture=False):
+        before = self.last_obs
+        result = self._step(action)
+        self.last_obs = result[0]
+        if capture:
+            return LiberoEnvFacade._capture_result(
+                result, before, [np.asarray(action)], [result]
+            )
+        return result
+
+    def chunk_step(self, actions, *, return_all_frames=None, capture=False):
+        self.chunk_return_all_frames = return_all_frames
+        before = self.last_obs
+        all_frames = (
+            self.return_all_frames if return_all_frames is None else return_all_frames
+        )
+        result = self._chunk_step(actions, return_all_frames=all_frames or capture)
+        obs, rewards, term, trunc, infos = result
+        self.last_obs = obs[-1] if all_frames or capture else obs
+        if not capture:
+            return result
+        native_result = (obs if all_frames else obs[-1], rewards, term, trunc, infos)
+        return LiberoEnvFacade._capture_result(
+            native_result,
+            before,
+            np.asarray(actions),
+            zip(obs, rewards, term, trunc, infos),
+        )
+
 
 class _Model:
     def predict(self, observation, *, options):
@@ -86,15 +114,13 @@ class _Model:
         return np.ones((2, 7), np.float32)
 
 
-def _primitives(env, config=None, molmo_client=None, *, capture_actions=False):
+def _primitives(env, molmo_client=None):
     return LiberoPrimitives(
         env=env,
         model=_Model(),
         sam3_client=SimpleNamespace(),
         check_cancelled=lambda: None,
-        flywheel_config=config,
         molmo_client=molmo_client,
-        capture_actions=capture_actions,
     )
 
 
@@ -158,7 +184,7 @@ def test_actions_follow_api_tool_calls(tmp_path, monkeypatch, mode, record_traje
         results.append(result)
         return result
 
-    monkeypatch.setattr(env, "step", step)
+    monkeypatch.setattr(env, "_step", step)
     chunk_calls = []
 
     def chunk_step(actions, *, return_all_frames=None):
@@ -173,7 +199,7 @@ def test_actions_follow_api_tool_calls(tmp_path, monkeypatch, mode, record_traje
             list(infos),
         )
 
-    monkeypatch.setattr(env, "chunk_step", chunk_step)
+    monkeypatch.setattr(env, "_chunk_step", chunk_step)
     direct = [0.1, 0.2, 0.3, 0.0, 0.0, 0.0, -1.0]
     calls = iter(
         [
@@ -255,12 +281,20 @@ def test_actions_follow_api_tool_calls(tmp_path, monkeypatch, mode, record_traje
         inline = [(row["action"]["data"], action.action.data)]
         np.testing.assert_array_equal(action.action.data, executed[index])
         assert action.action.data.dtype == executed[index].dtype
-        assert action.result.data == dict(
+        stored_result = {
+            **action.result.data,
+            "info": {
+                **action.result.data["info"],
+                "custom_stat": np.load(
+                    root / action.result.data["info"]["custom_stat"].path
+                ),
+            },
+        }
+        assert stored_result == dict(
             zip(("reward", "terminated", "truncated", "info"), results[index][1:])
         )
         assert isinstance(action.result.data["reward"], np.float32)
         assert action.executed_at is None
-        assert action.missing["executed_at"].reason == "not_exposed"
         for side, observation_id, value in (
             ("before", action.before_observation_id, index),
             ("after", action.after_observation_id, index + 1),
@@ -327,19 +361,13 @@ def test_actions_follow_api_tool_calls(tmp_path, monkeypatch, mode, record_traje
         assert row["tool_call_id"] == vla_call.tool_call_id
         assert row["instruction"] == "pick up the bowl"
         assert row["action_ids"] == [action.action_id for action in group]
+        assert row["input_observation"]["observation_id"] == row["input_observation_id"]
+        assert row["input_observation_id"] != group[0].before_observation_id
         assert (
-            row["input_observation"]["observation_id"]
-            == row["input_observation_id"]
-            == group[0].before_observation_id
+            row["input_observation"]["payload"]["data"]["task_descriptions"]
+            == "pick up the bowl"
         )
-        assert row["actions"]["format"] == "libero.action_chunk"
-        assert row["actions"]["completeness"] == "complete"
-        assert row["actions"]["data"] == {
-            "$type": "ndarray",
-            "dtype": "float32",
-            "shape": [2, 7],
-            "value": [action.action.data.tolist() for action in group],
-        }
+        assert "actions" not in row
 
     executed[1][:] = 99
     results[1][0]["states"][:] = 99
@@ -351,8 +379,6 @@ def test_actions_follow_api_tool_calls(tmp_path, monkeypatch, mode, record_traje
 
 @pytest.fixture
 def captured_primitives(tmp_path):
-    primitives = _primitives(_Env(), capture_actions=True)
-    primitives.reset()
     state = EnvState(tmp_path)
     state.start_task(instruction="release", config=Payload(format="test", data={}))
     planner_id = state.register_planner(backend="api")
@@ -363,6 +389,8 @@ def captured_primitives(tmp_path):
     )
     capture = ToolCallCapture(state, tool_call_id)
     capture.start()
+    primitives = _primitives(CapturingEnvClient(_Env(), state))
+    primitives.reset()
     return primitives, capture
 
 
@@ -373,8 +401,8 @@ def test_action_capture_keeps_confirmed_prefix(
     primitives, capture = captured_primitives
     if failure == "step":
         monkeypatch.setattr(
-            primitives.env,
-            "step",
+            primitives.env.wrapped,
+            "_step",
             Mock(side_effect=[(_obs(1), 0, False, False, {}), RuntimeError("step")]),
         )
     elif failure == "cancel":
@@ -412,7 +440,7 @@ def test_action_capture_preserves_terminal_flags(
     primitives, capture = captured_primitives
 
     def step(action):
-        setattr(primitives.env, terminal, True)
+        setattr(primitives.env.wrapped, terminal, True)
         return (
             _obs(1),
             np.float32(1),
@@ -421,7 +449,7 @@ def test_action_capture_preserves_terminal_flags(
             {},
         )
 
-    monkeypatch.setattr(primitives.env, "step", step)
+    monkeypatch.setattr(primitives.env.wrapped, "_step", step)
     with capture.bind():
         primitives.release(max_steps=3)
 
@@ -437,8 +465,8 @@ def test_unrecorded_action_breaks_observation_reuse(
 ):
     primitives, capture = captured_primitives
     monkeypatch.setattr(
-        primitives.env,
-        "step",
+        primitives.env.wrapped,
+        "_step",
         Mock(
             side_effect=[
                 (_obs(1), 0, False, False, {}),
@@ -472,15 +500,10 @@ def test_unrecorded_action_breaks_observation_reuse(
     next_call = capture.state.get_tool_call(next_id)
     assert next_call.before_observation_id == second.before_observation_id
     assert next_call.after_observation_id == third.after_observation_id
-    if failure:
-        assert second.before_observation_id is None
-        assert second.missing["before_observation_id"].reason == "capture_failed"
-        assert next_call.missing["before_observation_id"].reason == "capture_failed"
-    else:
-        observation = capture.state.get_observation(second.before_observation_id)
-        np.testing.assert_array_equal(
-            observation.payload.data["states"], _obs(2)["states"]
-        )
+    observation = capture.state.get_observation(second.before_observation_id)
+    np.testing.assert_array_equal(
+        observation.payload.data["states"], _obs(1 if failure else 2)["states"]
+    )
 
 
 @pytest.mark.parametrize("vla", [False, True])
@@ -494,8 +517,9 @@ def test_attachment_failure_preserves_confirmed_actions(
 
     def save_with_failure(value, **kwargs):
         nonlocal writes
-        writes += 1
-        if writes == failed_write:
+        is_image = isinstance(value, np.ndarray) and value.ndim > 1
+        writes += is_image
+        if is_image and writes == failed_write:
             raise OSError("image write failed")
         return save(value, **kwargs)
 
@@ -509,7 +533,7 @@ def test_attachment_failure_preserves_confirmed_actions(
     actions = capture.state.action_records()
     assert len(actions) == 2
     assert actions[0].after_observation_id == actions[1].before_observation_id
-    assert writes == 6
+    assert writes == (8 if vla else 6)
     assert isinstance(primitives._last_obs["main_images"], np.ndarray)
     capture.state.end_task(status="completed", stop_reason="finish")
     root = capture.state.save_planner_trajectory()
@@ -517,10 +541,18 @@ def test_attachment_failure_preserves_confirmed_actions(
         json.loads(line) for line in (root / "actions.jsonl").read_text().splitlines()
     ]
     assert len(saved) == 2
-    side = "before" if failed_write == 1 else "after"
-    observation = saved[0][f"{side}_observation"]["payload"]
+    if vla:
+        prediction = json.loads((root / "predictions.jsonl").read_text())
+        observation = (
+            prediction["input_observation"]
+            if failed_write == 1
+            else saved[0]["before_observation"]
+        )["payload"]
+    else:
+        side = "before" if failed_write == 1 else "after"
+        observation = saved[0][f"{side}_observation"]["payload"]
     assert observation["completeness"] == "partial"
-    assert "main_images" not in observation["data"]
+    assert observation["data"]["main_images"] is None
     assert observation["missing"]["/main_images"] == {
         "reason": "capture_failed",
         "detail": "OSError: image write failed",
@@ -531,23 +563,24 @@ def test_attachment_failure_preserves_confirmed_actions(
         assert saved[0]["after_observation"] == saved[1]["before_observation"]
     if vla:
         prediction = json.loads((root / "predictions.jsonl").read_text())
-        assert prediction["input_observation"] == saved[0]["before_observation"]
+        assert prediction["input_observation_id"] != saved[0]["before_observation_id"]
         assert prediction["action_ids"] == [row["action_id"] for row in saved]
 
 
 @pytest.mark.parametrize("frame_failure", [False, True])
 def test_vla_capture_keeps_all_confirmed_actions(
-    captured_primitives, monkeypatch, frame_failure
+    captured_primitives, monkeypatch, frame_failure, tmp_path
 ):
     primitives, capture = captured_primitives
     initial = primitives._last_obs
     predict = primitives.model.predict
 
     def predict_separately(observation, *, options):
-        assert primitives._observation_id is not None
-        captured = capture.state.get_observation(primitives._observation_id)
+        prediction = capture.state.prediction_records()[-1]
+        captured = capture.state.get_observation(prediction.input_observation_id)
+        root = tmp_path / "trajectories" / capture.state.get_task().task_id
         np.testing.assert_array_equal(
-            captured.payload.data["states"], initial["states"]
+            np.load(root / captured.payload.data["states"].path), initial["states"]
         )
         assert observation is not initial
         assert initial["task_descriptions"] == "put the bowl on the plate"
@@ -567,7 +600,7 @@ def test_vla_capture_keeps_all_confirmed_actions(
         else:
             primitives._vlm_chunk("pick up the bowl")
 
-    assert primitives.env.chunk_return_all_frames is True
+    assert primitives.env.chunk_return_all_frames is (True if frame_failure else None)
     actions = capture.state.action_records()
     assert [action.source for action in actions] == ["vla", "vla"]
     assert actions[0].after_observation_id == actions[1].before_observation_id
@@ -580,16 +613,21 @@ def test_vla_capture_keeps_all_confirmed_actions(
     observation = capture.state.get_observation(call.after_observation_id)
     np.testing.assert_array_equal(observation.payload.data["states"], _obs(3)["states"])
     (prediction,) = capture.state.prediction_records()
-    assert prediction.input_observation_id == actions[0].before_observation_id
+    assert prediction.input_observation_id != actions[0].before_observation_id
     assert prediction.action_ids == [action.action_id for action in actions]
-    np.testing.assert_array_equal(prediction.actions.data, np.ones((2, 7), np.float32))
+    np.testing.assert_array_equal(
+        np.stack(
+            [capture.state.get_action(key).action.data for key in prediction.action_ids]
+        ),
+        np.ones((2, 7), np.float32),
+    )
 
 
 @pytest.mark.parametrize(
     "terminal,step_count", [("terminated", 5), ("truncated", 5), ("terminated", 3)]
 )
 def test_predictions_keep_each_calls_context_and_confirmed_actions(
-    captured_primitives, monkeypatch, terminal, step_count
+    captured_primitives, monkeypatch, terminal, step_count, tmp_path
 ):
     primitives, capture = captured_primitives
     predicted = np.linspace(-1, 1, 35, dtype=np.float32).reshape(5, 7)
@@ -600,8 +638,8 @@ def test_predictions_keep_each_calls_context_and_confirmed_actions(
     predict = Mock(side_effect=chunks)
     monkeypatch.setattr(primitives.model, "predict", predict)
     monkeypatch.setattr(
-        primitives.env,
-        "chunk_step",
+        primitives.env.wrapped,
+        "_chunk_step",
         Mock(
             side_effect=[
                 (
@@ -633,14 +671,26 @@ def test_predictions_keep_each_calls_context_and_confirmed_actions(
             == request["task_descriptions"]
             == instructions[index]
         )
-        assert prediction.input_observation_id == group[0].before_observation_id
+        assert prediction.input_observation_id != group[0].before_observation_id
         observation = capture.state.get_observation(prediction.input_observation_id)
         np.testing.assert_array_equal(
-            observation.payload.data["states"], request["states"]
+            np.load(
+                tmp_path
+                / "trajectories"
+                / capture.state.get_task().task_id
+                / observation.payload.data["states"].path
+            ),
+            request["states"],
         )
         assert prediction.action_ids == [action.action_id for action in group]
         np.testing.assert_array_equal(
-            prediction.actions.data, chunks[index][:step_count]
+            np.stack(
+                [
+                    capture.state.get_action(key).action.data
+                    for key in prediction.action_ids
+                ]
+            ),
+            chunks[index][:step_count],
         )
 
 
@@ -656,9 +706,9 @@ def test_unexecuted_vla_actions_are_not_recorded(
     confirmed = capture.state.action_records()
     predictions = capture.state.prediction_records()
     initial = primitives._last_obs
-    execute_chunk = primitives.env.chunk_step
+    execute_chunk = primitives.env.wrapped._chunk_step
     chunk_step = Mock(side_effect=RuntimeError("chunk"))
-    monkeypatch.setattr(primitives.env, "chunk_step", chunk_step)
+    monkeypatch.setattr(primitives.env.wrapped, "_chunk_step", chunk_step)
     if failure == "predict":
         monkeypatch.setattr(
             primitives.model, "predict", Mock(side_effect=RuntimeError("predict"))
@@ -675,9 +725,9 @@ def test_unexecuted_vla_actions_are_not_recorded(
     assert [a.action_id for a in capture.state.action_records()] == [
         a.action_id for a in confirmed
     ]
-    assert [p.prediction_id for p in capture.state.prediction_records()] == [
-        p.prediction_id for p in predictions
-    ]
+    recorded_predictions = capture.state.prediction_records()
+    assert recorded_predictions[:-1] == predictions
+    assert recorded_predictions[-1].action_ids == []
     assert primitives._last_obs is initial
     assert initial["task_descriptions"] == "put the bowl on the plate"
     assert "extra_view_images" not in initial
@@ -692,110 +742,47 @@ def test_unexecuted_vla_actions_are_not_recorded(
             name="pi0_doubled",
             arguments=Payload("json", {"prompt": "pick up the bowl"}),
         )
-        monkeypatch.setattr(primitives.env, "chunk_step", execute_chunk)
+        monkeypatch.setattr(primitives.env.wrapped, "_chunk_step", execute_chunk)
         with ToolCallCapture(capture.state, next_id).bind():
             primitives._vlm_chunk("pick up the bowl")
         first, second = capture.state.action_records()[-2:]
-        assert first.before_observation_id is None
-        assert first.missing["before_observation_id"].reason == "capture_failed"
+        assert first.before_observation_id is not None
+        if confirmed:
+            assert first.before_observation_id != confirmed[-1].after_observation_id
         assert second.before_observation_id == first.after_observation_id
-        assert capture.state.get_tool_call(next_id).before_observation_id is None
+        assert (
+            capture.state.get_tool_call(next_id).before_observation_id
+            == first.before_observation_id
+        )
         prediction = capture.state.prediction_records()[-1]
-        assert prediction.input_observation_id is None
-        assert prediction.missing["input_observation_id"].reason == "capture_failed"
+        assert prediction.input_observation_id is not None
     elif confirmed_prefix:
         assert call.after_observation_id == confirmed[-1].after_observation_id
         assert "after_observation_id" not in call.missing
 
 
-@pytest.mark.parametrize("with_molmo", [False, True])
-def test_collection_records_scripted_and_vla_actions(tmp_path, with_molmo):
-    env = _Env()
-    molmo = SimpleNamespace() if with_molmo else None
-    primitives = _primitives(
-        env,
-        {
-            "root": tmp_path,
-            "suite": "libero_object",
-            "task_id": 2,
-            "seed": 3,
-        },
-        molmo_client=molmo,
-    )
-    assert primitives.molmo_client is molmo
-    primitives.reset()
-    primitives.begin_primitive("move_to")
-    primitives._step_env(np.zeros(7))
-    primitives.end_primitive()
-    primitives.begin_primitive("pi0_pick")
-    primitives._vlm_chunk("pick up the bowl")
-    primitives.end_primitive()
-
-    path = primitives.finalize_flywheel()
-    metadata = validate_episode(path, spec=LIBERO_SPEC)
-    assert metadata["step_count"] == 3
-    assert metadata["training_step_count"] == 3
-    assert env.chunk_return_all_frames is True
-    with np.load(path / "transitions.npz", allow_pickle=False) as data:
-        np.testing.assert_array_equal(data["action_source"], [0, 1, 1])
-        np.testing.assert_array_equal(data["primitive_id"], [0, 1, 1])
-
-
-def test_molmo_positional_argument_keeps_collection_disabled():
+def test_molmo_positional_argument_is_preserved():
     molmo = SimpleNamespace()
     primitives = LiberoPrimitives(
         _Env(), _Model(), SimpleNamespace(), lambda: None, molmo
     )
     primitives.reset()
     assert primitives.molmo_client is molmo
-    assert primitives.finalize_flywheel() is None
 
 
 @pytest.mark.parametrize("capture_actions", [False, True])
-def test_no_capture_context_keeps_fast_chunk_path(capture_actions):
+def test_no_capture_context_keeps_fast_chunk_path(capture_actions, tmp_path):
     env = _Env()
-    primitives = _primitives(env, capture_actions=capture_actions)
+    primitives = _primitives(
+        CapturingEnvClient(env, EnvState(tmp_path)) if capture_actions else env
+    )
     primitives.reset()
     primitives._vlm_chunk("pick up the bowl")
     assert env.chunk_return_all_frames is None
-    assert primitives.finalize_flywheel() is None
 
 
-def test_dashboard_flywheel_config_belongs_to_unique_env(tmp_path, monkeypatch):
-    args = SimpleNamespace(
-        collect_flywheel_data=True,
-        flywheel_root=str(tmp_path),
-        suite="libero_object",
-        task=2,
-        seed=3,
-    )
-    monkeypatch.setattr(
-        robot_spec,
-        "try_spawn_server",
-        lambda owned, events, component, starter: (None, component),
-    )
-    monkeypatch.setattr(
-        robot_spec,
-        "try_wait_server",
-        lambda *args, **kwargs: {},
-    )
-
-    _, shared = robot_spec._init_runtime(args, tmp_path, None, {"vla", "sam3"})
-    _, unique = robot_spec._init_runtime(args, tmp_path, None, {"env"})
-
-    assert "flywheel_config" not in shared
-    assert unique["flywheel_config"] == {
-        "root": str(tmp_path),
-        "suite": "libero_object",
-        "task_id": 2,
-        "seed": 3,
-    }
-
-
-@pytest.mark.parametrize("failure", [None, "finalize", "stop", "save"])
-def test_close_handles_collection_and_video_independently(
-    tmp_path, monkeypatch, failure
-):
+@pytest.mark.parametrize("failure", [None, "stop", "save"])
+def test_close_saves_video_and_handles_video_errors(tmp_path, monkeypatch, failure):
     toolkit = libero_toolkit.LiberoToolkit.__new__(libero_toolkit.LiberoToolkit)
     from rpent.memory import MemoryManager
     from rpent.tools import Toolkit
@@ -804,34 +791,22 @@ def test_close_handles_collection_and_video_independently(
         toolkit, dashboard_events=None, memory=MemoryManager(tmp_path / "memory")
     )
     frames = [_obs(0)["main_images"]]
-    finalize = Mock(return_value=tmp_path / "episode")
     stop = Mock(return_value=frames)
     save = Mock()
     if failure is not None:
-        {"finalize": finalize, "stop": stop, "save": save}[
-            failure
-        ].side_effect = RuntimeError(failure)
-    toolkit._primitives = SimpleNamespace(
-        finalize_flywheel=finalize, stop_recording=stop
-    )
+        {"stop": stop, "save": save}[failure].side_effect = RuntimeError(failure)
+    toolkit._primitives = SimpleNamespace(stop_recording=stop)
     toolkit._state = SimpleNamespace(save=save)
     logger = Mock()
     monkeypatch.setattr(libero_toolkit, "logger", logger)
 
     toolkit.close()
 
-    finalize.assert_called_once_with()
     stop.assert_called_once_with()
     if failure == "stop":
         save.assert_not_called()
     else:
         save.assert_called_once_with("episode.mp4", frames, step=None, fps=20)
-    if failure == "finalize":
-        logger.info.assert_not_called()
-    else:
-        logger.info.assert_called_once_with(
-            "flywheel episode finalized: %s", tmp_path / "episode"
-        )
     assert logger.warning.call_count == (failure is not None)
 
 

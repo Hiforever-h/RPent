@@ -26,6 +26,7 @@ from robots.robocasa import robot_spec, toolkit
 from rpent.dashboard.events import NullDashboardEventSink
 from rpent.memory import MemoryManager
 from rpent.robots import RunConfig
+from rpent.session.capture import CapturingEnvClient
 from rpent.tools import Toolkit, ToolResult
 from rpent.tools.common import CommonTools
 from rpent.utils import templates
@@ -126,8 +127,10 @@ def test_toolkit_constructs_and_classifies_tools_with_a_fake(
         lambda primitives, state, log: dumped.append(primitives) or _record(),
     )
 
+    env = object()
+    runtime_kwargs = {"env_client": env, "vla_client": object()}
     robot_toolkit = toolkit.RoboCasaToolkit(
-        runtime_kwargs={"env_client": object(), "vla_client": object()},
+        runtime_kwargs=runtime_kwargs,
         dashboard_events=NullDashboardEventSink(),
         memory=MemoryManager(tmp_path / "memory"),
         mode=mode,
@@ -143,6 +146,14 @@ def test_toolkit_constructs_and_classifies_tools_with_a_fake(
     primitive = fake_single_arm_primitives.instances[0]
     assert primitive.reset_calls == (1 if mode == "evaluation" else 0)
     assert primitive.kwargs["allow_reset"] is (mode == "exploration")
+    assert runtime_kwargs["env_client"] is env
+    if mode == "evaluation":
+        wrapped = primitive.kwargs["env_client"]
+        assert isinstance(wrapped, CapturingEnvClient)
+        assert wrapped.wrapped is env
+        assert wrapped.state is robot_toolkit.state
+    else:
+        assert primitive.kwargs["env_client"] is env
     assert primitive.recording_started is True
     assert callable(primitive.kwargs["check_cancelled"])
     assert (tmp_path / "success_criteria.md").read_text() == "offline success criteria"

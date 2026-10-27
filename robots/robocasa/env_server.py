@@ -19,6 +19,7 @@ import inspect
 import os
 import re
 import sys
+from copy import deepcopy
 
 import numpy as np
 
@@ -217,15 +218,59 @@ class RoboCasaEnvFacade(MainThreadServeMixin, BaseEnvFacade):
                 self.env.rng = np.random.default_rng(sd)
         return self.env.reset()
 
-    def step(self, flat_action):
-        """flat_action: np.ndarray[12] = [eef_pos(3), eef_rot(3), gripper(1),
-        base_motion(4), control_mode(1)] in the PandaOmron composite layout."""
+    def step(self, flat_action, *, capture: bool = False):
+        """Execute a native PandaOmron action, optionally returning capture details."""
         a = np.asarray(flat_action, dtype=np.float64).reshape(-1)
         assert a.shape[0] == self.env.action_dim, (
             f"action dim {a.shape[0]} != env.action_dim {self.env.action_dim}"
         )
+        before = (
+            self._capture_observation(self.env._get_observations()) if capture else None
+        )
         obs, reward, done, info = self.env.step(a)
-        return obs, reward, done, info
+        result = (obs, reward, done, info)
+        if not capture:
+            return result
+        return {
+            "result": result,
+            "before_observation": before,
+            "steps": [
+                {
+                    "action": {
+                        "format": "robocasa.action",
+                        "data": a,
+                        "completeness": "complete",
+                        "inline_array_paths": ("",),
+                    },
+                    "after_observation": self._capture_observation(obs),
+                    "result": {
+                        "format": "robocasa.step_result",
+                        "data": {"reward": reward, "done": done, "info": info},
+                        "completeness": "complete",
+                    },
+                }
+            ],
+        }
+
+    def _capture_observation(self, obs) -> dict:
+        """Snapshot native state and top-down RGB images for trajectory capture."""
+        data = deepcopy(obs)
+        data["images"] = {
+            camera: self.render_camera(camera, self.camera_h, self.camera_w, False)[
+                ::-1
+            ]
+            for camera in self.cameras
+        }
+        return {
+            "format": "robocasa.observation",
+            "data": data,
+            "completeness": "complete",
+            "inline_array_paths": tuple(
+                f"/{key}"
+                for key, value in obs.items()
+                if isinstance(value, np.ndarray) and value.ndim <= 1
+            ),
+        }
 
     def check_success(self):
         return bool(self.env._check_success())

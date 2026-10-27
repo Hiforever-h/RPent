@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Read schema-v3 trajectory records, loading array attachments on demand."""
+"""Read schema-v3/v4 trajectory records, loading attachments on demand."""
 
 from __future__ import annotations
 
@@ -54,14 +54,18 @@ def iter_trajectories(
             document = json.loads(task_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:
             raise ValueError(f"{task_path}:{exc.lineno}: {exc.msg}") from exc
-        if not isinstance(document, dict) or document.get("schema_version") != 3:
-            raise ValueError(f"{task_path}: expected trajectory schema_version 3")
+        if not isinstance(document, dict) or document.get("schema_version") not in (
+            3,
+            4,
+        ):
+            raise ValueError(f"{task_path}: expected trajectory schema_version 3 or 4")
         if not isinstance(document.get("task"), dict):
             raise ValueError(f"{task_path}: expected a task object")
 
         trajectory_root = task_path.parent
         yield {
             "root": trajectory_root,
+            "schema_version": document["schema_version"],
             "task": document["task"],
             "actions": _read_jsonl(trajectory_root / "actions.jsonl"),
             "predictions": _read_jsonl(trajectory_root / "predictions.jsonl"),

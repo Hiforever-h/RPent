@@ -182,8 +182,9 @@ def test_toolkit_constructs_and_captures_an_initial_observation(
         ),
     )
 
+    runtime_kwargs = {"env": object(), "model": object(), "seed": 7}
     robot_toolkit = toolkit.RoboTwinToolkit(
-        runtime_kwargs={"env": object(), "model": object(), "seed": 7},
+        runtime_kwargs=runtime_kwargs,
         dashboard_events=NullDashboardEventSink(),
         memory=MemoryManager(tmp_path / "memory"),
     )
@@ -201,6 +202,8 @@ def test_toolkit_constructs_and_captures_an_initial_observation(
         "elapsed_s": 0.0,
     }
     primitive = FakeRoboTwinPrimitives.instances[0]
+    assert primitive.kwargs["env"].wrapped is runtime_kwargs["env"]
+    assert primitive.kwargs["env"].state is robot_toolkit.state
     assert primitive.status_calls == 1
     assert primitive.recording_started is True
     assert callable(primitive.kwargs["check_cancelled"])

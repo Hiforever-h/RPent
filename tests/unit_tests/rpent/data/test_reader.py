@@ -57,7 +57,6 @@ def _save_trajectory(output: Path) -> Path:
         tool_call_id=tool,
         input_observation_id=observations[0],
         instruction="拿起杯子",
-        actions=Payload("test.actions", actions, inline_array_paths=("",)),
         action_ids=action_ids,
     )
     state.end_task(
@@ -73,6 +72,7 @@ def test_reads_saved_records_and_arrays_without_robot_specific_fields(tmp_path):
     trajectory = next(iter_trajectories(root))
 
     assert trajectory["root"] == root.resolve()
+    assert trajectory["schema_version"] == 4
     assert trajectory["task"]["result"]["data"]["environment_success"] is False
     actions = trajectory["actions"]
     prediction = trajectory["predictions"][0]
@@ -87,9 +87,10 @@ def test_reads_saved_records_and_arrays_without_robot_specific_fields(tmp_path):
         assert image.dtype == np.uint8 and image.shape == (3, 4, 3)
         np.testing.assert_array_equal(image, np.full((3, 4, 3), index))
         np.testing.assert_array_equal(read_array(root, obs["state"]), [index, 0, 1])
+    assert "actions" not in prediction
     np.testing.assert_array_equal(
-        read_array(root, prediction["actions"]["data"]),
         np.stack([read_array(root, action["action"]["data"]) for action in actions]),
+        [[1, 2], [3, 4]],
     )
 
 

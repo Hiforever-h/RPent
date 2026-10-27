@@ -177,13 +177,12 @@ class ActionRecord:
 
 @dataclass
 class PredictionRecord:
-    """Confirmed executed actions from one VLA prediction."""
+    """Context and ordered references to the executed actions of one VLA prediction."""
 
     prediction_id: str
     planner_id: str | None
     tool_call_id: str
     input_observation_id: str | None
     instruction: str
-    actions: Payload
-    action_ids: list[str]  # Same order as actions.data.
+    action_ids: list[str]
     missing: dict[str, MissingInfo] = field(default_factory=dict)

@@ -249,7 +249,7 @@ class Toolkit:
             try:
                 self.raise_if_cancelled()
                 if capture is not None:
-                    capture.start()
+                    capture.start(action_source=tool.action_source)
                 native = tool(**kwargs)
             except TypeError as exc:
                 native = ToolResult(

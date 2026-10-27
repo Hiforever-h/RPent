@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any, Literal
 
 import numpy as np
@@ -144,6 +145,22 @@ class RoboTwinAgentEnv(RoboTwinEnv):
             "actual_seed": int(actual_seed),
         }
 
+    def _capture_observation(self, sub_env: Any, native: dict) -> dict[str, Any]:
+        """Snapshot native cameras and robot state while holding ``sub_env.lock``."""
+        state = self._robot_state(sub_env)
+        return {
+            "format": "robotwin.observation",
+            "data": deepcopy(
+                {
+                    "observation": native["observation"],
+                    "robot_state": state,
+                    "task_language": str(sub_env.task.get_instruction()),
+                }
+            ),
+            "completeness": "complete",
+            "inline_array_paths": tuple(f"/robot_state/{key}" for key in state),
+        }
+
     def chunk_step(
         self,
         actions: Any,
@@ -151,6 +168,7 @@ class RoboTwinAgentEnv(RoboTwinEnv):
         action_type: RoboTwinActionType = "qpos",
         env_id: int = 0,
         return_all_frames: bool = False,
+        capture: bool = False,
     ) -> tuple[list[Any], np.ndarray, np.ndarray, np.ndarray, list[dict[str, Any]]]:
         """Execute a chunk of native actions, returning a gym-style 5-tuple batched as ``[1, executed]``."""
         array = _validate_actions(actions, action_type=action_type)
@@ -162,6 +180,13 @@ class RoboTwinAgentEnv(RoboTwinEnv):
         frames: list[np.ndarray] = []
         executed = 0
         with sub_env.lock:
+            if capture:
+                capture_data = {
+                    "before_observation": self._capture_observation(
+                        sub_env, sub_env.task.get_obs()
+                    ),
+                    "steps": [],
+                }
             for action in array:
                 status = self._episode_status(sub_env)
                 if _execution_should_stop(status):
@@ -181,10 +206,34 @@ class RoboTwinAgentEnv(RoboTwinEnv):
                 terminations.append(bool(step_status["eval_success"]))
                 truncations.append(bool(budget))
                 per_step.append({"episode_status": step_status})
+                if capture or return_all_frames:
+                    native_observation = sub_env.task.get_obs()
+                if capture:
+                    capture_data["steps"].append(
+                        {
+                            "action": {
+                                "format": f"robotwin.action.{action_type}",
+                                "data": action.copy(),
+                                "completeness": "complete",
+                                "inline_array_paths": ("",),
+                            },
+                            "after_observation": self._capture_observation(
+                                sub_env, native_observation
+                            ),
+                            "result": {
+                                "format": "robotwin.step_result",
+                                "data": {
+                                    "reward": rewards[-1],
+                                    "terminated": terminations[-1],
+                                    "truncated": truncations[-1],
+                                    "info": per_step[-1],
+                                },
+                                "completeness": "complete",
+                            },
+                        }
+                    )
                 if return_all_frames:
-                    head_rgb = sub_env.task.get_obs()["observation"]["head_camera"][
-                        "rgb"
-                    ]
+                    head_rgb = native_observation["observation"]["head_camera"]["rgb"]
                     frames.append(
                         np.asarray(
                             self.center_and_crop(head_rgb, center_crop=self.center_crop)
@@ -206,6 +255,8 @@ class RoboTwinAgentEnv(RoboTwinEnv):
             "episode_status": episode_status,
             "per_step": per_step,
         }
+        if capture:
+            info["capture"] = capture_data
         return (
             [observation],
             np.asarray(rewards, dtype=np.float32).reshape(1, -1),
@@ -221,6 +272,7 @@ class RoboTwinAgentEnv(RoboTwinEnv):
         action_type: RoboTwinActionType = "qpos",
         auto_reset: bool = False,
         env_id: int = 0,
+        capture: bool = False,
     ) -> tuple[Any, np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
         """Execute a single native action; the N=1 case of ``chunk_step``."""
         if auto_reset:
@@ -229,7 +281,7 @@ class RoboTwinAgentEnv(RoboTwinEnv):
         if array.shape[0] != 1:
             raise ValueError("RoboTwinAgentEnv.step expects a single action")
         observation_list, rewards, terminated, truncated, info_list = self.chunk_step(
-            array, action_type=action_type, env_id=env_id
+            array, action_type=action_type, env_id=env_id, capture=capture
         )
         return (
             observation_list[0],

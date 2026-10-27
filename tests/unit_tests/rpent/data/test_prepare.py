@@ -40,10 +40,10 @@ def test_selects_executed_predictions_across_chunks_without_loading_images(traje
     assert segment["instruction"] == "pick up the bowl"
     np.testing.assert_array_equal(
         segment["actions"],
-        np.concatenate(
+        np.stack(
             [
-                read_array(trajectory["root"], prediction["actions"]["data"])
-                for prediction in trajectory["predictions"]
+                read_array(trajectory["root"], action["action"]["data"])
+                for action in trajectory["actions"][1:7]
             ]
         ),
     )
@@ -87,7 +87,7 @@ def test_vla_actions_without_a_prediction_are_excluded(trajectory):
 
 def test_unexecuted_prediction_does_not_supply_training_actions(trajectory):
     prediction = deepcopy(trajectory["predictions"][0])
-    prediction.update(prediction_id="V-unexecuted", action_ids=[], actions=None)
+    prediction.update(prediction_id="V-unexecuted", action_ids=[])
     trajectory["predictions"].append(prediction)
     assert _ranges(select_vla_segments(trajectory)) == [(1, 7)]
 
@@ -132,6 +132,18 @@ def test_missing_required_action_data_excludes_the_step_and_breaks_continuity(
     assert _ranges(select_vla_segments(trajectory)) == [(1, 2), (3, 7)]
 
 
+def test_action_record_cannot_contain_an_entire_chunk(trajectory):
+    payload = trajectory["actions"][2]["action"]
+    payload["format"] = "libero.action_chunk"
+    payload["data"]["shape"] = [1, 7]
+    payload["data"]["value"] = [payload["data"]["value"]]
+    result = select_vla_segments(trajectory)
+    assert _ranges(result) == [(1, 2), (3, 7)]
+    assert any(
+        "Expected one executed action" in row["reason"] for row in result["rejected"]
+    )
+
+
 @pytest.mark.parametrize("index,expected", [(1, [(4, 7)]), (2, [(1, 2), (3, 7)])])
 def test_incomplete_before_observation_excludes_the_prediction_or_step(
     trajectory, index, expected
@@ -157,13 +169,42 @@ def test_final_after_observation_data_is_not_required_for_samples(trajectory, fi
     assert len(list(iter_samples(trajectory, result["segments"]))) == 26
 
 
-def test_executed_action_must_equal_its_prediction(trajectory):
+def test_legacy_executed_action_must_equal_its_prediction(legacy_trajectory):
+    trajectory = legacy_trajectory
     trajectory["actions"][2]["action"]["data"]["value"][0] += 1
     result = select_vla_segments(trajectory)
     assert _ranges(result) == [(1, 2), (3, 7)]
     assert any(
         "differs from its prediction" in row["reason"] for row in result["rejected"]
     )
+
+
+def test_legacy_prediction_action_count_must_match_references(legacy_trajectory):
+    prediction = legacy_trajectory["predictions"][0]
+    array = prediction["actions"]["data"]
+    array["value"].append(array["value"][-1])
+    array["shape"][0] += 1
+    result = select_vla_segments(legacy_trajectory)
+    assert _ranges(result) == [(4, 7)]
+    assert any("different lengths" in row["reason"] for row in result["rejected"])
+
+
+def test_legacy_predictions_still_supply_complete_training_samples(legacy_trajectory):
+    result = select_vla_segments(legacy_trajectory)
+    assert legacy_trajectory["schema_version"] == 3
+    assert _ranges(result) == [(1, 7)]
+    assert result["rejected"] == []
+    expected = np.concatenate(
+        [
+            read_array(legacy_trajectory["root"], row["actions"]["data"])
+            for row in legacy_trajectory["predictions"]
+        ]
+    )
+    samples = list(iter_samples(legacy_trajectory, result["segments"], horizon=2))
+    assert len(samples) == 5
+    for offset, sample in enumerate(samples):
+        assert sample["actions"].dtype == np.float32
+        np.testing.assert_array_equal(sample["actions"], expected[offset : offset + 2])
 
 
 def test_action_from_another_tool_call_is_excluded(trajectory):
@@ -183,7 +224,6 @@ def test_missing_observation_mark_is_respected_even_if_reference_exists(trajecto
     [
         "empty_instruction",
         "wrong_input",
-        "extra_prediction",
         "reverse_actions",
         "missing_input",
     ],
@@ -194,10 +234,6 @@ def test_invalid_prediction_does_not_supply_training_actions(trajectory, corrupt
         prediction["instruction"] = " "
     elif corruption == "wrong_input":
         prediction["input_observation_id"] = "O-wrong"
-    elif corruption == "extra_prediction":
-        array = prediction["actions"]["data"]
-        array["value"].append(array["value"][-1])
-        array["shape"][0] += 1
     elif corruption == "reverse_actions":
         prediction["action_ids"][1:] = reversed(prediction["action_ids"][1:])
     else:
@@ -259,23 +295,25 @@ def test_script_between_predictions_breaks_the_segment_without_being_a_candidate
 
 
 @pytest.mark.parametrize("trajectory", [35], indirect=True)
-def test_segment_and_sample_action_values_and_dtype_come_from_predictions(trajectory):
+def test_segment_and_sample_action_values_and_dtype_come_from_executed_actions(
+    trajectory,
+):
     for action in trajectory["actions"]:
         action["action"]["data"]["dtype"] = "float64"
     result = select_vla_segments(trajectory)
-    expected = np.concatenate(
+    expected = np.stack(
         [
-            read_array(trajectory["root"], prediction["actions"]["data"])
-            for prediction in trajectory["predictions"]
+            read_array(trajectory["root"], action["action"]["data"])
+            for action in trajectory["actions"][1:36]
         ]
     )
     segment = result["segments"][0]
-    assert segment["actions"].dtype == expected.dtype == np.float32
+    assert segment["actions"].dtype == expected.dtype == np.float64
     np.testing.assert_array_equal(segment["actions"], expected)
     samples = list(iter_samples(trajectory, result["segments"]))
     assert len(samples) == 26
     for offset, sample in enumerate(samples):
-        assert sample["actions"].dtype == np.float32
+        assert sample["actions"].dtype == np.float64
         np.testing.assert_array_equal(sample["actions"], expected[offset : offset + 10])
 
 

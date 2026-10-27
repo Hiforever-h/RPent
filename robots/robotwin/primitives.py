@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import nullcontext
 from typing import Annotated, Any, Literal
 
 import numpy as np
@@ -25,6 +26,7 @@ from pydantic import Field
 from robots.robotwin.env_client import RoboTwinEnvClient
 from robots.robotwin.robot_spec import MODEL_SPEC, ROBOTWIN_CAMERA_NAMES
 from robots.robotwin.vla_client import LingBotVLAClient
+from rpent.session.capture import CapturingEnvClient
 from rpent.tools import ToolResult, tool
 
 
@@ -253,15 +255,23 @@ class RoboTwinPrimitives:
                 break
             observation = self._build_lingbot_observation()
             native_prompt = observation["task_language"]
-            actions = self.model.infer(observation)[: MODEL_SPEC.use_length]
-            self._check_cancelled()
-            payload, _, _, _, info = self.env.chunk_step(
-                actions,
-                action_type="ee",
-                return_all_frames=self._recording
-                and self.env.execution_capabilities.get("chunk_step_all_frames")
-                is True,
+            prediction = (
+                self.env.prediction(
+                    observation, native_prompt, format="lingbot.observation"
+                )
+                if isinstance(self.env, CapturingEnvClient)
+                else nullcontext()
             )
+            with prediction:
+                actions = self.model.infer(observation)[: MODEL_SPEC.use_length]
+                self._check_cancelled()
+                payload, _, _, _, info = self.env.chunk_step(
+                    actions,
+                    action_type="ee",
+                    return_all_frames=self._recording
+                    and self.env.execution_capabilities.get("chunk_step_all_frames")
+                    is True,
+                )
             if self._recording and isinstance(payload, dict) and "frames" in payload:
                 for frame in payload["frames"]:
                     self.record_frame(frame)
