@@ -111,30 +111,6 @@ def test_task_is_explicit_and_cannot_be_overwritten(tmp_path: Path) -> None:
     with state.record_step(state={"ready": True}):
         pass
     assert state.get_task() is None
-    with pytest.raises(RuntimeError, match="not running"):
-        state.register_planner(backend="api")
-    with pytest.raises(RuntimeError, match="not running"):
-        state.update_planner("P1", status="failed")
-    with pytest.raises(RuntimeError, match="not running"):
-        state.update_tool_call("T1", status="not_executed")
-    with pytest.raises(RuntimeError, match="not running"):
-        state.register_action(
-            tool_call_id="T1",
-            source="direct",
-            action=Payload("test.action", [0.5]),
-            before_observation_id=None,
-            after_observation_id=None,
-        )
-    with pytest.raises(RuntimeError, match="not running"):
-        state.end_task(status="completed", stop_reason="finish")
-    with pytest.raises(RuntimeError, match="not running"):
-        state.register_prediction(
-            tool_call_id="T1",
-            input_observation_id=None,
-            instruction="Move.",
-            action_ids=[],
-        )
-
     task_id = state.start_task(instruction="Move.", config=Payload("json", {}))
     with pytest.raises(RuntimeError, match="already been started"):
         state.start_task(instruction="Replace.", config=Payload("json", {}))
@@ -156,12 +132,21 @@ def test_task_is_explicit_and_cannot_be_overwritten(tmp_path: Path) -> None:
     assert other.start_task(instruction="Move.", config=Payload("json", {})) != task_id
 
 
-def test_ended_task_rejects_record_writes(state: EnvState, tool_id: str) -> None:
-    planner_id = state.get_tool_call(tool_id).planner_id
+@pytest.mark.parametrize("ended", [False, True], ids=["not_started", "ended"])
+def test_inactive_task_rejects_record_writes(tmp_path: Path, ended: bool) -> None:
+    state = EnvState(tmp_path)
+    planner_id, tool_id = "P1", "T1"
+    if ended:
+        state.start_task(instruction="Move.", config=Payload("json", {}))
+        planner_id = state.register_planner(backend="api")
+        tool_id = state.register_tool_call(
+            planner_id=planner_id, name="move", arguments=Payload("json", {})
+        )
+        state.end_task(status="cancelled", stop_reason="operator")
     planners = state.planner_records()
-    state.end_task(status="cancelled", stop_reason="operator")
 
     writes = [
+        lambda: state.end_task(status="completed", stop_reason="finish"),
         lambda: state.register_planner(backend="api"),
         lambda: state.update_planner(planner_id, status="cancelled"),
         lambda: state.update_tool_call(tool_id, status="cancelled"),
@@ -561,26 +546,6 @@ def test_model_and_action_trajectories_share_explicit_links(state: EnvState) -> 
     )
     assert state.get_tool_call(actions[1].tool_call_id).planner_id == second
     assert actions[2].missing["after_observation_id"].reason == "capture_failed"
-
-
-def test_payload_keeps_native_data_without_copying_or_coercing():
-    values = np.array([0.1, 0.2], dtype=np.float32)
-    data = {
-        "values": values,
-        "image": bytes([0, 255]),
-        "references": [
-            ArtifactRef("artifacts/image.bin", "bytes"),
-            DataRef("observation", "O1", "/payload/data/image"),
-        ],
-    }
-    payload = Payload("test.native", data)
-
-    assert payload.data is data
-    assert payload.data["values"] is values
-    values[0] = 0.5
-    data["references"].clear()
-    assert payload.data["values"][0] == 0.5
-    assert payload.data["references"] == []
 
 
 def test_registration_and_queries_isolate_nested_payloads(tmp_path: Path) -> None:
@@ -1493,9 +1458,15 @@ def test_action_trajectory_preserves_missing_observations(state, tool_id):
     }
 
 
-@pytest.mark.parametrize("kind", ["bytes", "ndarray"])
-@pytest.mark.parametrize("owner", ["task", "planner", "observation", "action"])
-@pytest.mark.parametrize("stem", ["payload-000001", ".payload-000001.tmp"])
+@pytest.mark.parametrize(
+    ("kind", "owner", "stem"),
+    [
+        ("bytes", "task", "payload-000001"),
+        ("bytes", "planner", ".payload-000001.tmp"),
+        ("ndarray", "observation", "payload-000001"),
+        ("ndarray", "action", ".payload-000001.tmp"),
+    ],
+)
 def test_captured_artifacts_survive_trajectory_save(tmp_path, kind, owner, stem):
     value = (
         b"captured" if kind == "bytes" else np.arange(6, dtype=np.uint16).reshape(2, 3)

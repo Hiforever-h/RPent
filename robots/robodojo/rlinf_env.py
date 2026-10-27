@@ -174,10 +174,15 @@ class RoboDojoAgentEnv(RoboDojoEnv):
             self.env.step_lim
         ):
             raise RuntimeError("Episode step budget exhausted")
+        if capture:
+            # Flush stale camera frames before each captured observation.
+            self.env.get_obs(env_idx=0)
         before = deepcopy(self._observation(record=False)) if capture else None
         self._sub_env(0).apply_action(
             flat_action, action_type, eval_fair=self.eval_fair
         )
+        if capture:
+            self.env.get_obs(env_idx=0)
         if self.eval_fair:
             result = self._observation(), 0.0, False, {"status": self.get_status()}
         else:

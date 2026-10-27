@@ -40,7 +40,10 @@ class _Client:
         return {
             "states": np.array([self.position], dtype=np.float32),
             "joint/history~": np.array([[self.position]], dtype=np.float32),
-            "cameras": {"front": [np.full((2, 3, 3), self.position, dtype=np.uint8)]},
+            "cameras": {
+                "front": [np.full((2, 3, 3), self.position, dtype=np.uint8)],
+                "wrist": np.full((2, 3, 3), self.position + 1, dtype=np.uint8),
+            },
         }
 
     def reset(self):
@@ -244,13 +247,15 @@ def test_payload_snapshots_and_nested_attachments(env, capture, tmp_path):
     np.testing.assert_array_equal(
         np.load(root / image.path), np.ones((2, 3, 3), dtype=np.uint8)
     )
-    assert len(list((root / "artifacts").iterdir())) == 2
+    assert len(list((root / "artifacts").iterdir())) == 4
     capture.state.end_task(status="completed", stop_reason="finish")
     capture.state.save_planner_trajectory()
-    assert len(list((root / "artifacts").iterdir())) == 2
+    assert len(list((root / "artifacts").iterdir())) == 4
 
 
-@pytest.mark.parametrize("interruption", ["reset", "failure", "uncaptured_step"])
+@pytest.mark.parametrize(
+    "interruption", ["reset", "failure", "uncaptured_step", "uncaptured_failure"]
+)
 def test_interruptions_break_observation_reuse(env, capture, interruption):
     with capture.bind():
         env.step([1])
@@ -268,7 +273,13 @@ def test_interruptions_break_observation_reuse(env, capture, interruption):
         env.wrapped.fail = False
         expected_before = 3
     else:
-        env.step([2])
+        if interruption == "uncaptured_failure":
+            env.wrapped.fail = True
+            with pytest.raises(RuntimeError, match="step failed"):
+                env.step([2])
+            env.wrapped.fail = False
+        else:
+            env.step([2])
         assert env.calls[-1] == ("step", {})
         expected_before = 3
     with capture.bind():
@@ -311,21 +322,54 @@ def test_empty_execution_creates_no_records_or_attachments(env, capture, tmp_pat
     assert not (tmp_path / "trajectories").exists()
 
 
-def test_attachment_failure_preserves_the_executed_action(env, capture, monkeypatch):
-    def fail(value):
-        raise OSError("disk full")
+@pytest.mark.parametrize(
+    "failed_observation", [0, 1, 2], ids=["input", "before", "after"]
+)
+def test_attachment_failure_preserves_executed_actions(
+    env, capture, monkeypatch, failed_observation, tmp_path
+):
+    save = capture.state.save_trajectory_artifact
+    image_count = 0
 
-    monkeypatch.setattr(capture.state, "save_trajectory_artifact", fail)
-    with capture.bind():
+    def save_image(value):
+        nonlocal image_count
+        if value.ndim == 3:
+            image_count += 1
+            if image_count == 2 * failed_observation + 1:
+                raise OSError("disk full")
+        return save(value)
+
+    monkeypatch.setattr(capture.state, "save_trajectory_artifact", save_image)
+    with capture.bind(), env.prediction(env.last_obs, "Move.", format="test.input"):
         env.step([1])
-    action = capture.state.action_records()[0]
-    np.testing.assert_array_equal(action.action.data, [1])
-    payload = capture.state.get_observation(action.after_observation_id).payload
+        env.step([2])
+    first, second = capture.state.action_records()
+    np.testing.assert_array_equal([first.action.data, second.action.data], [[1], [2]])
+    assert first.after_observation_id == second.before_observation_id
+    prediction = capture.state.prediction_records()[0]
+    assert prediction.action_ids == [first.action_id, second.action_id]
+    observations = [
+        capture.state.get_observation(observation_id).payload
+        for observation_id in (
+            prediction.input_observation_id,
+            first.before_observation_id,
+            first.after_observation_id,
+            second.after_observation_id,
+        )
+    ]
+    payload = observations[failed_observation]
     assert payload.data["cameras"]["front"] == [None]
     assert payload.completeness == "partial"
     assert payload.missing["/cameras/front/0"] == MissingInfo(
         "capture_failed", "OSError: disk full"
     )
+    root = tmp_path / "trajectories" / capture.state.get_task().task_id
+    for index, observation in enumerate(observations):
+        assert (root / observation.data["cameras"]["wrist"].path).is_file()
+        if index != failed_observation:
+            image = observation.data["cameras"]["front"][0]
+            assert (root / image.path).is_file()
+    assert image_count == 8
 
 
 @pytest.mark.parametrize("source", ["tool_computed", "direct"])
