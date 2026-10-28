@@ -89,7 +89,6 @@ def trajectory(tmp_path, request):
         stop = min(start + 3, vla_steps + 1)
         state.register_prediction(
             tool_call_id=tools[1],
-            input_observation_id=observations[start],
             instruction="pick up the bowl",
             action_ids=actions[start:stop],
         )
@@ -98,7 +97,26 @@ def trajectory(tmp_path, request):
         stop_reason="finish",
         result=Payload("libero.result", {"environment_success": True}),
     )
-    return next(iter_trajectories(state.save_planner_trajectory()))
+    root = state.save_planner_trajectory()
+    # Keep these reader/cleaner fixtures in their supported v4 format.
+    task_path = root / "task.json"
+    document = json.loads(task_path.read_text())
+    document["schema_version"] = 4
+    task_path.write_text(json.dumps(document))
+    saved_actions = {
+        row["action_id"]: row
+        for row in map(json.loads, (root / "actions.jsonl").read_text().splitlines())
+    }
+    predictions_path = root / "predictions.jsonl"
+    predictions = [
+        json.loads(line) for line in predictions_path.read_text().splitlines()
+    ]
+    for prediction in predictions:
+        first = saved_actions[prediction["action_ids"][0]]
+        prediction["input_observation_id"] = first["before_observation_id"]
+        prediction["input_observation"] = first["before_observation"]
+    predictions_path.write_text("".join(json.dumps(row) + "\n" for row in predictions))
+    return next(iter_trajectories(root))
 
 
 @pytest.fixture

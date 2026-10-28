@@ -256,9 +256,7 @@ class RoboTwinPrimitives:
             observation = self._build_lingbot_observation()
             native_prompt = observation["task_language"]
             prediction = (
-                self.env.prediction(
-                    observation, native_prompt, format="lingbot.observation"
-                )
+                self.env.prediction(native_prompt)
                 if isinstance(self.env, CapturingEnvClient)
                 else nullcontext()
             )

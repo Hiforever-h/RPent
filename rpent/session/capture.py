@@ -126,22 +126,14 @@ class CapturingEnvClient:
         return self._execute(self.wrapped.chunk_step, *args, **kwargs)
 
     @contextmanager
-    def prediction(
-        self, observation: Any, instruction: str, *, format: str
-    ) -> Iterator[str | None]:
-        """Register a prediction's actual input and group actions executed in this scope."""
+    def prediction(self, instruction: str) -> Iterator[str | None]:
+        """Group executed actions under one VLA prediction."""
         capture = current_tool_call.get()
         if capture is None or capture.state is not self.state:
             yield None
             return
-        observation_id = self.state.register_observation(
-            payload=self._payload(
-                {"format": format, "data": observation, "completeness": "complete"}
-            )
-        )
         prediction_id = self.state.register_prediction(
             tool_call_id=capture.tool_call_id,
-            input_observation_id=observation_id,
             instruction=instruction,
         )
         previous = capture.prediction_id

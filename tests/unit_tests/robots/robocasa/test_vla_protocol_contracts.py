@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import nullcontext
 from copy import deepcopy
 from pathlib import Path
@@ -31,7 +32,7 @@ from robots.robocasa.primitives import RoboCasaPrimitives
 from robots.robocasa.prompt_bundle import system_prompt
 from robots.robocasa.vla_server import _normalize_legacy_processor_geometry
 from rpent.dashboard.events import NullDashboardEventSink
-from rpent.data.reader import iter_trajectories, read_array
+from rpent.data.reader import read_array
 from rpent.memory import MemoryManager
 from rpent.prompt.utils import format_prompt
 from rpent.robots.components.action_spec import box_action_spec
@@ -463,6 +464,23 @@ def test_robocasa_tools_capture_executed_actions_and_rldx_history(
     assert facade.env.observation_reads == (7 if recording else 0)
     np.testing.assert_allclose(facade.env.executed[1][7:11], [0.1, -0.1, 0.1, -0.1])
     assert [a[6] for a in facade.env.executed[1:5]] == [-1, 1, -1, 1]
+    inputs = primitives._rldx._vla_client.inputs
+    assert len(inputs) == 2
+    for index, (observation, options) in enumerate(inputs):
+        assert options == {"reset_memory": [index == 0]}
+        assert observation["annotation.human.task_description"] == [
+            "Open the left drawer."
+        ]
+        for camera in DEFAULT_CAMS:
+            history = observation[f"video.{camera}"]
+            assert history.shape == (1, 2, 4, 4, 3)
+            for frame, count in enumerate((1, 1 + index * 2)):
+                np.testing.assert_array_equal(
+                    history[0, frame, :, 0, 0], np.arange(4)[::-1] + count * 10
+                )
+        for key, value in observation.items():
+            if key.startswith("state."):
+                np.testing.assert_array_equal(value, np.full_like(value, 1 + index * 2))
     if not recording:
         assert state.action_records() == state.prediction_records() == []
         assert not (tmp_path / "trajectories").exists()
@@ -470,8 +488,10 @@ def test_robocasa_tools_capture_executed_actions_and_rldx_history(
 
     state.end_task(status="completed", stop_reason="finish")
     root = state.save_planner_trajectory()
-    (trajectory,) = list(iter_trajectories(root))
-    actions = trajectory["actions"]
+    assert json.loads((root / "task.json").read_text())["schema_version"] == 5
+    actions = [
+        json.loads(line) for line in (root / "actions.jsonl").read_text().splitlines()
+    ]
     assert [a["source"] for a in actions] == [
         "tool_computed",
         "vla",
@@ -482,6 +502,8 @@ def test_robocasa_tools_capture_executed_actions_and_rldx_history(
         "direct",
     ]
     for index, action in enumerate(actions):
+        assert action["before_observation_id"] == f"O{index + 1}"
+        assert action["after_observation_id"] == f"O{index + 2}"
         assert action["action"]["format"] == "robocasa.action"
         native = read_array(root, action["action"]["data"])
         assert native.dtype == np.float64
@@ -502,32 +524,16 @@ def test_robocasa_tools_capture_executed_actions_and_rldx_history(
                 np.testing.assert_array_equal(
                     image[:, 0, 0], np.arange(4)[::-1] + count * 10
                 )
-        if index:
-            assert (
-                action["before_observation_id"]
-                == actions[index - 1]["after_observation_id"]
-            )
-    predictions = trajectory["predictions"]
+    predictions = [
+        json.loads(line)
+        for line in (root / "predictions.jsonl").read_text().splitlines()
+    ]
     assert [p["action_ids"] for p in predictions] == [["A2", "A3"], ["A4", "A5"]]
-    for prediction, (expected, options) in zip(
-        predictions, primitives._rldx._vla_client.inputs, strict=True
-    ):
+    for prediction in predictions:
         assert prediction["instruction"] == "Open the left drawer."
-        payload = prediction["input_observation"]["payload"]
-        assert payload["format"] == "rldx.observation"
-        for key, value in expected.items():
-            actual = payload["data"][key]
-            if isinstance(value, np.ndarray):
-                np.testing.assert_array_equal(read_array(root, actual), value)
-            else:
-                assert actual == value
+        assert "input_observation" not in prediction
+        assert "input_observation_id" not in prediction
         assert "actions" not in prediction
-    first, second = primitives._rldx._vla_client.inputs
-    assert first[1] == {"reset_memory": [True]}
-    assert second[1] == {"reset_memory": [False]}
-    history = second[0]["video.robot0_agentview_left"]
-    assert history.shape == (1, 2, 4, 4, 3)
-    assert history[0, 0, 0, 0, 0] != history[0, 1, 0, 0, 0]
 
 
 def test_robocasa_failed_step_keeps_prior_steps_and_ends_prediction_scope(

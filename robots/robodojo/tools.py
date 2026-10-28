@@ -419,7 +419,7 @@ def pi0_pick(
                 )
                 t["last_grip"] = t["start_grip"]
         prediction = (
-            primitives.env.prediction(obs, prompt, format="robodojo.observation")
+            primitives.env.prediction(prompt)
             if isinstance(primitives.env, CapturingEnvClient)
             else nullcontext()
         )

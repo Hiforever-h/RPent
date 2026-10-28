@@ -281,7 +281,7 @@ class RLDXSkill:
             if self._check_cancelled is not None:
                 self._check_cancelled()
             prediction = (
-                self.env.prediction(obs, prompt, format="rldx.observation")
+                self.env.prediction(prompt)
                 if isinstance(self.env, CapturingEnvClient)
                 else nullcontext()
             )

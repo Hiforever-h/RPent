@@ -14,6 +14,7 @@
 
 """Agent-only observation, policy shape and CLI configuration contracts."""
 
+import json
 from contextlib import nullcontext
 from copy import deepcopy
 from types import SimpleNamespace
@@ -26,7 +27,7 @@ from robots.robodojo.env_client import RoboDojoEnvClient
 from robots.robodojo.env_facade import RoboDojoEnvFacade
 from robots.robodojo.toolkit import RoboDojoToolkit
 from rpent.dashboard.events import NullDashboardEventSink
-from rpent.data.reader import iter_trajectories, read_array
+from rpent.data.reader import read_array
 from rpent.memory import MemoryManager
 from rpent.session import Payload
 from rpent.session.capture import ToolCallCapture
@@ -356,8 +357,14 @@ def test_toolkit_saves_only_executed_predictions_and_restores_source(
         return
     state.end_task(status="completed", stop_reason="finish")
     root = state.save_planner_trajectory()
-    (trajectory,) = list(iter_trajectories(root))
-    actions, predictions = trajectory["actions"], trajectory["predictions"]
+    assert json.loads((root / "task.json").read_text())["schema_version"] == 5
+    actions = [
+        json.loads(line) for line in (root / "actions.jsonl").read_text().splitlines()
+    ]
+    predictions = [
+        json.loads(line)
+        for line in (root / "predictions.jsonl").read_text().splitlines()
+    ]
     assert [a["source"] for a in actions] == ["vla"] * 4 + ["tool_computed"]
     assert [p["action_ids"] for p in predictions] == [["A1", "A2", "A3"], ["A4"]]
     for index, action in enumerate(actions):
@@ -369,20 +376,21 @@ def test_toolkit_saves_only_executed_predictions_and_restores_source(
                 read_array(root, saved) if isinstance(value, np.ndarray) else saved,
                 value,
             )
-        if index:
-            assert (
-                action["before_observation_id"]
-                == actions[index - 1]["after_observation_id"]
-            )
+        assert action["before_observation_id"] == f"O{index + 1}"
+        assert action["after_observation_id"] == f"O{index + 2}"
         for side, count in (("before", index), ("after", index + 1)):
             obs = action[f"{side}_observation"]["payload"]["data"]
             for camera in obs["vision"].values():
                 np.testing.assert_array_equal(
                     read_array(root, camera["color"]), np.full((2, 2, 3), count)
                 )
+    actions_by_id = {action["action_id"]: action for action in actions}
     for prediction, expected in zip(predictions, inputs, strict=True):
         assert prediction["instruction"] == expected["instruction"] == "pick bottle"
-        obs = prediction["input_observation"]["payload"]["data"]
+        assert "input_observation" not in prediction
+        assert "input_observation_id" not in prediction
+        first = actions_by_id[prediction["action_ids"][0]]
+        obs = first["before_observation"]["payload"]["data"]
         for key, value in expected["state"].items():
             np.testing.assert_array_equal(read_array(root, obs["state"][key]), value)
         for name, camera in expected["vision"].items():

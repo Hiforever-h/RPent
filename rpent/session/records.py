@@ -182,7 +182,6 @@ class PredictionRecord:
     prediction_id: str
     planner_id: str | None
     tool_call_id: str
-    input_observation_id: str | None
     instruction: str
     action_ids: list[str]
     missing: dict[str, MissingInfo] = field(default_factory=dict)

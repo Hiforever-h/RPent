@@ -386,7 +386,6 @@ class EnvState:
         self,
         *,
         tool_call_id: str,
-        input_observation_id: str | None,
         instruction: str,
         action_ids: list[str] | None = None,
         missing: dict[str, MissingInfo] | None = None,
@@ -406,7 +405,6 @@ class EnvState:
                     prediction_id=self._new_record_id("V"),
                     planner_id=tool_call.planner_id,
                     tool_call_id=tool_call_id,
-                    input_observation_id=input_observation_id,
                     instruction=instruction,
                     action_ids=action_ids,
                     missing=missing or {},
@@ -757,7 +755,7 @@ class EnvState:
         observations: dict[str, Any] = {}
         for filename, records, sides in (
             ("actions.jsonl", self._actions.values(), ("before", "after")),
-            ("predictions.jsonl", self._predictions.values(), ("input",)),
+            ("predictions.jsonl", self._predictions.values(), ()),
         ):
             with self._write_trajectory_file(root / filename) as file:
                 for record in records:
@@ -780,7 +778,7 @@ class EnvState:
                     file.write("\n")
         with self._write_trajectory_file(root / "task.json") as file:
             json.dump(
-                {"schema_version": 4, "task": encode(self._task)},
+                {"schema_version": 5, "task": encode(self._task)},
                 file,
                 ensure_ascii=False,
                 allow_nan=False,

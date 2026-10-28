@@ -297,10 +297,10 @@ def test_interruptions_break_observation_reuse(env, capture, interruption):
 def test_no_matching_capture_passes_through_without_a_task(capture, tmp_path):
     state = EnvState(tmp_path / "other")
     env = CapturingEnvClient(_Client(), state)
-    with env.prediction({"state": [0]}, "Move.", format="test.input"):
+    with env.prediction("Move."):
         assert env.step([1]) is env.wrapped.last_result
     with capture.bind():
-        with env.prediction({"state": [1]}, "Move again.", format="test.input"):
+        with env.prediction("Move again."):
             assert (
                 env.chunk_step([[2]], return_all_frames=True) is env.wrapped.last_result
             )
@@ -311,10 +311,19 @@ def test_no_matching_capture_passes_through_without_a_task(capture, tmp_path):
     assert not (tmp_path / "other" / "trajectories").exists()
 
 
-def test_empty_execution_creates_no_records_or_attachments(env, capture, tmp_path):
+def test_prediction_without_actions_creates_no_observations_or_attachments(
+    env, capture, tmp_path
+):
     env.wrapped.chunk_limit = 0
-    with capture.bind():
+    with capture.bind(), env.prediction("Move.") as prediction_id:
+        assert env.calls == []
+        assert not (tmp_path / "trajectories").exists()
         assert env.chunk_step([[1]]) is env.wrapped.last_result
+    (prediction,) = capture.state.prediction_records()
+    assert prediction.prediction_id == prediction_id
+    assert prediction.instruction == "Move."
+    assert prediction.action_ids == []
+    assert capture.prediction_id is None
     assert capture.state.action_records() == []
     assert (
         capture.state.get_tool_call(capture.tool_call_id).before_observation_id is None
@@ -322,9 +331,7 @@ def test_empty_execution_creates_no_records_or_attachments(env, capture, tmp_pat
     assert not (tmp_path / "trajectories").exists()
 
 
-@pytest.mark.parametrize(
-    "failed_observation", [0, 1, 2], ids=["input", "before", "after"]
-)
+@pytest.mark.parametrize("failed_observation", [0, 1], ids=["before", "after"])
 def test_attachment_failure_preserves_executed_actions(
     env, capture, monkeypatch, failed_observation, tmp_path
 ):
@@ -340,7 +347,7 @@ def test_attachment_failure_preserves_executed_actions(
         return save(value)
 
     monkeypatch.setattr(capture.state, "save_trajectory_artifact", save_image)
-    with capture.bind(), env.prediction(env.last_obs, "Move.", format="test.input"):
+    with capture.bind(), env.prediction("Move."):
         env.step([1])
         env.step([2])
     first, second = capture.state.action_records()
@@ -351,7 +358,6 @@ def test_attachment_failure_preserves_executed_actions(
     observations = [
         capture.state.get_observation(observation_id).payload
         for observation_id in (
-            prediction.input_observation_id,
             first.before_observation_id,
             first.after_observation_id,
             second.after_observation_id,
@@ -369,7 +375,7 @@ def test_attachment_failure_preserves_executed_actions(
         if index != failed_observation:
             image = observation.data["cameras"]["front"][0]
             assert (root / image.path).is_file()
-    assert image_count == 8
+    assert image_count == 6
 
 
 @pytest.mark.parametrize("source", ["tool_computed", "direct"])
@@ -379,7 +385,7 @@ def test_tool_dispatch_sets_source_and_restores_it_after_vla(
     def move(values: list[float]) -> ToolResult:
         """Move the arm."""
         env.step(values)
-        with env.prediction(env.last_obs, "Adjust the arm.", format="test.input"):
+        with env.prediction("Adjust the arm."):
             env.step([2])
         env.step(values)
         return ToolResult(data={"ok": True})
@@ -405,27 +411,18 @@ def test_tool_dispatch_sets_source_and_restores_it_after_vla(
     assert capture.state.get_tool_call(capture.tool_call_id).status == "completed"
 
 
-def test_predictions_group_only_executed_actions_and_capture_actual_inputs(
+def test_predictions_group_executed_actions_without_extra_observations(
     env, capture, tmp_path
 ):
-    first_input = {
-        "state_history": np.array([[10], [20]], dtype=np.float32),
-        "language": ["Pick up the cup."],
-    }
-    second_input = {"state_history": np.array([[30]], dtype=np.float32)}
     with capture.bind():
-        with env.prediction(
-            first_input, "Pick up the cup.", format="test.policy_input"
-        ):
+        with env.prediction("Pick up the cup."):
             env.step([1])
             env.step([2])
         env.step([4])
-        with env.prediction(second_input, "Place it down.", format="test.policy_input"):
+        with env.prediction("Place it down."):
             env.wrapped.chunk_limit = 1
             env.chunk_step([[5], [6]])
         env.step([7])
-    first_input["state_history"][:] = 99
-    first_input["language"][0] = "changed"
 
     actions = capture.state.action_records()
     first, second = capture.state.prediction_records()
@@ -440,24 +437,21 @@ def test_predictions_group_only_executed_actions_and_capture_actual_inputs(
     assert second.action_ids == [actions[3].action_id]
     assert first.instruction == "Pick up the cup."
     assert second.instruction == "Place it down."
-    for prediction, action in [(first, actions[0]), (second, actions[3])]:
+    for prediction in (first, second):
         assert prediction.tool_call_id == capture.tool_call_id
         assert (
             prediction.planner_id
             == capture.state.get_tool_call(capture.tool_call_id).planner_id
         )
-        assert prediction.input_observation_id != action.before_observation_id
     np.testing.assert_array_equal(actions[3].action.data, [5])
-    assert actions[3].before_observation_id == actions[2].after_observation_id
+    assert [
+        (action.before_observation_id, action.after_observation_id)
+        for action in actions
+    ] == [(f"O{index + 1}", f"O{index + 2}") for index in range(len(actions))]
     before = capture.state.get_observation(actions[0].before_observation_id).payload
     np.testing.assert_array_equal(before.data["states"], [0])
-    payload = capture.state.get_observation(first.input_observation_id).payload
-    assert payload.format == "test.policy_input" and payload.completeness == "complete"
-    assert payload.data["language"] == ["Pick up the cup."]
     root = tmp_path / "trajectories" / capture.state.get_task().task_id
-    np.testing.assert_array_equal(
-        np.load(root / payload.data["state_history"].path), [[10], [20]]
-    )
+    assert len(list((root / "artifacts").iterdir())) == 2 * (len(actions) + 1)
 
 
 @pytest.mark.parametrize("failure", ["predict", "execute"])
@@ -466,7 +460,7 @@ def test_prediction_failure_keeps_completed_actions_and_restores_source(
 ):
     with capture.bind():
         with pytest.raises(RuntimeError):
-            with env.prediction(env.last_obs, "Move.", format="test.input"):
+            with env.prediction("Move."):
                 if failure == "predict":
                     raise RuntimeError("model prediction failed")
                 env.step([1])

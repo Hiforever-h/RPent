@@ -23,6 +23,7 @@ from rpent.session import EnvState, Payload
 
 
 def _save_trajectory(output: Path) -> Path:
+    """Build a v4 trajectory for the reader's supported format."""
     state = EnvState(output)
     state.start_task(instruction="Move the cup", config=Payload("test.config", {}))
     planner = state.register_planner(backend="api")
@@ -55,7 +56,6 @@ def _save_trajectory(output: Path) -> Path:
     ]
     state.register_prediction(
         tool_call_id=tool,
-        input_observation_id=observations[0],
         instruction="拿起杯子",
         action_ids=action_ids,
     )
@@ -64,7 +64,18 @@ def _save_trajectory(output: Path) -> Path:
         stop_reason="finish",
         result=Payload("test.result", {"environment_success": False}),
     )
-    return state.save_planner_trajectory()
+    root = state.save_planner_trajectory()
+    task_path = root / "task.json"
+    document = json.loads(task_path.read_text())
+    document["schema_version"] = 4
+    task_path.write_text(json.dumps(document))
+    first = json.loads((root / "actions.jsonl").read_text().splitlines()[0])
+    predictions_path = root / "predictions.jsonl"
+    prediction = json.loads(predictions_path.read_text())
+    prediction["input_observation_id"] = first["before_observation_id"]
+    prediction["input_observation"] = first["before_observation"]
+    predictions_path.write_text(json.dumps(prediction) + "\n")
+    return root
 
 
 def test_reads_saved_records_and_arrays_without_robot_specific_fields(tmp_path):
@@ -129,7 +140,12 @@ def test_preserves_empty_failed_trajectory(tmp_path):
     state = EnvState(tmp_path)
     state.start_task(instruction="Move", config=Payload("test.config", {}))
     state.end_task(status="failed", stop_reason="setup_error")
-    trajectory = next(iter_trajectories(state.save_planner_trajectory()))
+    root = state.save_planner_trajectory()
+    task_path = root / "task.json"
+    document = json.loads(task_path.read_text())
+    document["schema_version"] = 4
+    task_path.write_text(json.dumps(document))
+    trajectory = next(iter_trajectories(root))
     assert trajectory["task"]["status"] == "failed"
     assert trajectory["actions"] == trajectory["predictions"] == []
 
@@ -156,7 +172,13 @@ def test_invalid_jsonl_reports_filename_and_physical_line(tmp_path, filename, ba
 
 @pytest.mark.parametrize(
     "contents",
-    ["{\ninvalid", "[]", '{"schema_version": 2, "task": {}}', '{"schema_version": 3}'],
+    [
+        "{\ninvalid",
+        "[]",
+        '{"schema_version": 2, "task": {}}',
+        '{"schema_version": 5, "task": {}}',
+        '{"schema_version": 3}',
+    ],
 )
 def test_invalid_task_reports_source_file(tmp_path, contents):
     root = _save_trajectory(tmp_path)
@@ -202,8 +224,9 @@ def test_reads_inline_arrays_using_the_current_writer(tmp_path, array):
         config=Payload("test.array", array, inline_array_paths=("",)),
     )
     state.end_task(status="failed", stop_reason="setup_error")
-    trajectory = next(iter_trajectories(state.save_planner_trajectory()))
-    restored = read_array(trajectory["root"], trajectory["task"]["config"]["data"])
+    root = state.save_planner_trajectory()
+    task = json.loads((root / "task.json").read_text())["task"]
+    restored = read_array(root, task["config"]["data"])
     np.testing.assert_array_equal(restored, array)
     assert restored.dtype == array.dtype and restored.shape == array.shape
 

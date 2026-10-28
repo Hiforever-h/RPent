@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 from contextlib import nullcontext
 from copy import deepcopy
@@ -32,7 +33,7 @@ from robots.robotwin import toolkit
 from robots.robotwin.env_client import RoboTwinEnvClient
 from robots.robotwin.primitives import RoboTwinPrimitives
 from rpent.dashboard.events import NullDashboardEventSink
-from rpent.data.reader import iter_trajectories, read_array
+from rpent.data.reader import read_array
 from rpent.memory import MemoryManager
 from rpent.session import EnvState, Payload
 from rpent.session.capture import CapturingEnvClient, ToolCallCapture
@@ -494,8 +495,14 @@ def test_lingbot_predictions_and_action_sources_reach_disk(
         return
     state.end_task(status="completed", stop_reason="finish")
     root = state.save_planner_trajectory()
-    (trajectory,) = list(iter_trajectories(root))
-    actions, predictions = trajectory["actions"], trajectory["predictions"]
+    assert json.loads((root / "task.json").read_text())["schema_version"] == 5
+    actions = [
+        json.loads(line) for line in (root / "actions.jsonl").read_text().splitlines()
+    ]
+    predictions = [
+        json.loads(line)
+        for line in (root / "predictions.jsonl").read_text().splitlines()
+    ]
     assert [a["source"] for a in actions] == [
         "direct",
         *(["vla"] * 50),
@@ -513,11 +520,14 @@ def test_lingbot_predictions_and_action_sources_reach_disk(
             == expected["task_language"]
             == "native instruction"
         )
-        payload = prediction["input_observation"]["payload"]
-        assert payload["format"] == "lingbot.observation"
+        assert "input_observation" not in prediction
+        assert "input_observation_id" not in prediction
+        payload = actions[start - 1]["before_observation"]["payload"]
+        assert payload["format"] == "robotwin.observation"
         for name, camera in expected["views"].items():
             np.testing.assert_array_equal(
-                read_array(root, payload["data"]["views"][name]["rgb"]), camera["rgb"]
+                read_array(root, payload["data"]["observation"][CAMERAS[name]]["rgb"]),
+                camera["rgb"],
             )
         np.testing.assert_array_equal(
             read_array(root, payload["data"]["robot_state"]["left_eef_pose"]),
@@ -531,11 +541,8 @@ def test_lingbot_predictions_and_action_sources_reach_disk(
         np.testing.assert_array_equal(
             read_array(root, action["action"]["data"]), native
         )
-        if index:
-            assert (
-                action["before_observation_id"]
-                == actions[index - 1]["after_observation_id"]
-            )
+        assert action["before_observation_id"] == f"O{index + 1}"
+        assert action["after_observation_id"] == f"O{index + 2}"
         for side, count in (("before", index), ("after", index + 1)):
             data = action[f"{side}_observation"]["payload"]["data"]
             np.testing.assert_array_equal(
@@ -564,7 +571,7 @@ def test_failed_chunk_discards_its_steps_but_keeps_prior_calls(
         env = CapturingEnvClient(client, state)
         with ToolCallCapture(state, tool_id).bind():
             env.step(np.zeros(14))
-            with env.prediction({}, "native instruction", format="lingbot.observation"):
+            with env.prediction("native instruction"):
                 with pytest.raises(RpcError, match="native action failed"):
                     env.chunk_step(np.zeros((5, 16)), action_type="ee")
     assert len(task.executed) == 3

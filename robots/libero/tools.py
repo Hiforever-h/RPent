@@ -168,11 +168,7 @@ class LiberoPrimitives:
 
         policy_obs = {**self._last_obs, "task_descriptions": instruction}
         policy_obs.setdefault("extra_view_images", None)
-        prediction = (
-            self.env.prediction(policy_obs, instruction, format="libero.observation")
-            if capturing
-            else nullcontext()
-        )
+        prediction = self.env.prediction(instruction) if capturing else nullcontext()
         with prediction:
             actions = self.model.predict(policy_obs, options=options)
             self._check_cancelled()

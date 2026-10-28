@@ -309,12 +309,8 @@ def test_actions_follow_api_tool_calls(tmp_path, monkeypatch, mode, record_traje
         assert row["tool_call_id"] == vla_call.tool_call_id
         assert row["instruction"] == "pick up the bowl"
         assert row["action_ids"] == [action.action_id for action in group]
-        assert row["input_observation"]["observation_id"] == row["input_observation_id"]
-        assert row["input_observation_id"] != group[0].before_observation_id
-        assert (
-            row["input_observation"]["payload"]["data"]["task_descriptions"]
-            == "pick up the bowl"
-        )
+        assert "input_observation" not in row
+        assert "input_observation_id" not in row
         assert "actions" not in row
 
 
@@ -402,19 +398,14 @@ def test_action_capture_preserves_terminal_flags(
 
 @pytest.mark.parametrize("frame_failure", [False, True])
 def test_vla_capture_keeps_all_confirmed_actions(
-    captured_primitives, monkeypatch, frame_failure, tmp_path
+    captured_primitives, monkeypatch, frame_failure
 ):
     primitives, capture = captured_primitives
     initial = primitives._last_obs
     predict = primitives.model.predict
 
     def predict_separately(observation, *, options):
-        prediction = capture.state.prediction_records()[-1]
-        captured = capture.state.get_observation(prediction.input_observation_id)
-        root = tmp_path / "trajectories" / capture.state.get_task().task_id
-        np.testing.assert_array_equal(
-            np.load(root / captured.payload.data["states"].path), initial["states"]
-        )
+        np.testing.assert_array_equal(observation["states"], initial["states"])
         assert observation is not initial
         assert initial["task_descriptions"] == "put the bowl on the plate"
         assert "extra_view_images" not in initial
@@ -446,7 +437,8 @@ def test_vla_capture_keeps_all_confirmed_actions(
     observation = capture.state.get_observation(call.after_observation_id)
     np.testing.assert_array_equal(observation.payload.data["states"], _obs(3)["states"])
     (prediction,) = capture.state.prediction_records()
-    assert prediction.input_observation_id != actions[0].before_observation_id
+    before = capture.state.get_observation(actions[0].before_observation_id)
+    np.testing.assert_array_equal(before.payload.data["states"], initial["states"])
     assert prediction.action_ids == [action.action_id for action in actions]
     np.testing.assert_array_equal(
         np.stack(
@@ -457,7 +449,7 @@ def test_vla_capture_keeps_all_confirmed_actions(
 
 
 def test_predictions_keep_each_calls_context_and_confirmed_actions(
-    captured_primitives, monkeypatch, tmp_path
+    captured_primitives, monkeypatch
 ):
     primitives, capture = captured_primitives
     step_count = 3
@@ -502,16 +494,9 @@ def test_predictions_keep_each_calls_context_and_confirmed_actions(
             == request["task_descriptions"]
             == instructions[index]
         )
-        assert prediction.input_observation_id != group[0].before_observation_id
-        observation = capture.state.get_observation(prediction.input_observation_id)
+        observation = capture.state.get_observation(group[0].before_observation_id)
         np.testing.assert_array_equal(
-            np.load(
-                tmp_path
-                / "trajectories"
-                / capture.state.get_task().task_id
-                / observation.payload.data["states"].path
-            ),
-            request["states"],
+            observation.payload.data["states"], request["states"]
         )
         assert prediction.action_ids == [action.action_id for action in group]
         np.testing.assert_array_equal(
@@ -698,7 +683,7 @@ def test_libero_client_facade_capture_and_raw_trajectory_roundtrip(
 ):
     from robots.libero.env_client import LiberoEnvClient
     from robots.libero.env_server import LiberoEnvFacade
-    from rpent.data.reader import iter_trajectories, read_array
+    from rpent.data.reader import read_array
     from rpent.session import EnvState
     from rpent.session.capture import CapturingEnvClient, ToolCallCapture
 
@@ -724,10 +709,7 @@ def test_libero_client_facade_capture_and_raw_trajectory_roundtrip(
         env = CapturingEnvClient(client, state)
         with capture.bind() if capture else nullcontext():
             env.step(np.zeros(7, dtype=np.float32))
-            policy_obs = {**env.last_obs, "task_descriptions": "pick up the bowl"}
-            with env.prediction(
-                policy_obs, "pick up the bowl", format="libero.observation"
-            ):
+            with env.prediction("pick up the bowl"):
                 result = env.chunk_step(commands, return_all_frames=all_frames)
         assert client.terminated and not client.truncated
         np.testing.assert_array_equal(result[2], [False, True, False, False, False])
@@ -742,20 +724,26 @@ def test_libero_client_facade_capture_and_raw_trajectory_roundtrip(
         return
     state.end_task(status="completed", stop_reason="finish")
     root = state.save_planner_trajectory()
-    (trajectory,) = list(iter_trajectories(root))
-    actions = trajectory["actions"]
+    assert json.loads((root / "task.json").read_text())["schema_version"] == 5
+    actions = [
+        json.loads(line) for line in (root / "actions.jsonl").read_text().splitlines()
+    ]
     assert len(actions) == 6
     assert [action["source"] for action in actions] == ["tool_computed", *(["vla"] * 5)]
-    (prediction,) = trajectory["predictions"]
+    (prediction,) = [
+        json.loads(line)
+        for line in (root / "predictions.jsonl").read_text().splitlines()
+    ]
     assert prediction["action_ids"] == [action["action_id"] for action in actions[1:]]
     assert "actions" not in prediction
-    assert (
-        prediction["input_observation"]["payload"]["data"]["task_descriptions"]
-        == "pick up the bowl"
-    )
+    assert prediction["instruction"] == "pick up the bowl"
+    assert "input_observation" not in prediction
+    assert "input_observation_id" not in prediction
     for index, (action, command) in enumerate(
         zip(actions, backend.executed, strict=True)
     ):
+        assert action["before_observation_id"] == f"O{index + 1}"
+        assert action["after_observation_id"] == f"O{index + 2}"
         np.testing.assert_array_equal(
             read_array(root, action["action"]["data"]), command
         )
@@ -791,7 +779,7 @@ def test_libero_failed_chunk_discards_its_actions_and_refreshes_next_before_obse
             env.step(np.zeros(7))
             backend.fail_at = 3
             with pytest.raises(RpcError, match="native step failed"):
-                with env.prediction(env.last_obs, "move", format="libero.observation"):
+                with env.prediction("move"):
                     env.chunk_step(np.ones((4, 7)))
             assert len(state.action_records()) == 1
             assert state.prediction_records()[0].action_ids == []
