@@ -36,7 +36,7 @@ pytest tests/unit_tests -v
 
 Inspect any files changed by hooks and rerun affected checks. The
 [unit-test workflow](../../../.github/workflows/unittest.yml) defines the full
-Python matrix and additional data-export dependencies; one local environment does
+Python matrix and additional Flywheel dependencies; one local environment does
 not cover that matrix. Do not install every robot extra for an unrelated change.
 
 For the supported GPU suites, follow the environment setup in the test guide

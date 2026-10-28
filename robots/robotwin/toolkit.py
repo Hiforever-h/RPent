@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 
@@ -34,6 +34,7 @@ from rpent.tools.toolkit import Toolkit
 from rpent.utils.logging import get_output_dir
 
 if TYPE_CHECKING:
+    from robots.robotwin.env_client import RoboTwinEnvClient
     from rpent.memory.manager import MemoryManager
 
 # State-advancing RoboTwin primitives eligible for the recipe. ``reset``,
@@ -115,9 +116,14 @@ class RoboTwinToolkit(Toolkit):
         self._attempts_per_session = max(0, int(attempts_per_session))
         self._latest_status: dict[str, Any] = {}
         if self._mode == "evaluation":
+            env = runtime_kwargs["env"]
             runtime_kwargs = {
                 **runtime_kwargs,
-                "env": CapturingEnvClient(runtime_kwargs["env"], state),
+                "env": CapturingEnvClient(
+                    env,
+                    state,
+                    capture_call=partial(_capture_robotwin_call, env),
+                ),
             }
         self._primitives = RoboTwinPrimitives(
             check_cancelled=self.raise_if_cancelled,
@@ -354,3 +360,15 @@ class RoboTwinToolkit(Toolkit):
         if saved is None:
             raise RuntimeError(f"failed to save RoboTwin recipe artifact: {name}")
         return str(destination.artifact_path(name, step=None))
+
+
+def _capture_robotwin_call(
+    env: RoboTwinEnvClient,
+    method: Literal["step", "chunk_step"],
+    *args: Any,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Execute a RoboTwin call and extract its capture data."""
+    result = getattr(env, method)(*args, capture=True, **kwargs)
+    capture_data = result[4].pop("capture")
+    return {"result": result, **capture_data}

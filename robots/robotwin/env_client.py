@@ -112,7 +112,7 @@ class RoboTwinEnvClient(BaseEnvClient):
         *,
         action_type: RoboTwinActionType = "qpos",
         capture: bool = False,
-    ) -> tuple[Any, Any, Any, Any, dict[str, Any]] | dict[str, Any]:
+    ) -> tuple[Any, Any, Any, Any, dict[str, Any]]:
         """Execute one RoboTwin action and update the cached episode state."""
         flat = self._validate_action_request(action_type, action)
         if flat.shape[0] != 1:
@@ -122,24 +122,19 @@ class RoboTwinEnvClient(BaseEnvClient):
         kwargs = {"action_type": action_type}
         if capture:
             kwargs["capture"] = True
-        response = self._client.call(
+        result = self._client.call(
             "env.step",
             args=(flat,),
             kwargs=kwargs,
             timeout_s=ROBOTWIN_STATE_CHANGE_TIMEOUT_S,
         )
-        result = self._require_result_tuple(
-            response["result"] if capture else response, 5, "env.step"
-        )
+        result = self._require_result_tuple(result, 5, "env.step")
         _, _, terminated, truncated, info = result
         self._require_episode_status(info)
         self.last_obs = result[0]
         self.last_info = info
         self.terminated |= bool(np.asarray(terminated).any())
         self.truncated |= bool(np.asarray(truncated).any())
-        if capture:
-            response["result"] = result
-            return response
         return result
 
     def chunk_step(
@@ -149,7 +144,7 @@ class RoboTwinEnvClient(BaseEnvClient):
         action_type: RoboTwinActionType = "qpos",
         return_all_frames: bool = False,
         capture: bool = False,
-    ) -> tuple[Any, Any, Any, Any, dict[str, Any]] | dict[str, Any]:
+    ) -> tuple[Any, Any, Any, Any, dict[str, Any]]:
         """Execute a RoboTwin action chunk and cache the final episode state."""
         array = self._validate_action_request(action_type, actions)
         if (
@@ -162,15 +157,13 @@ class RoboTwinEnvClient(BaseEnvClient):
         kwargs = {"action_type": action_type, "return_all_frames": return_all_frames}
         if capture:
             kwargs["capture"] = True
-        response = self._client.call(
+        result = self._client.call(
             "env.chunk_step",
             args=(array,),
             kwargs=kwargs,
             timeout_s=ROBOTWIN_STATE_CHANGE_TIMEOUT_S,
         )
-        result = self._require_result_tuple(
-            response["result"] if capture else response, 5, "env.chunk_step"
-        )
+        result = self._require_result_tuple(result, 5, "env.chunk_step")
         _, _, terminated, truncated, info = result
         self._require_episode_status(info)
         n_executed = info.get("executed_actions")
@@ -197,9 +190,6 @@ class RoboTwinEnvClient(BaseEnvClient):
         self.last_info = info
         self.terminated |= bool(np.asarray(terminated).any())
         self.truncated |= bool(np.asarray(truncated).any())
-        if capture:
-            response["result"] = result
-            return response
         return result
 
     def render_camera(self, camera_name: str, *, depth: bool = False) -> Any:

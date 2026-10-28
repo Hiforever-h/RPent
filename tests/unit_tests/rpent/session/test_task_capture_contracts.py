@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Task capture outcomes at runner cleanup boundaries."""
+"""API task capture snapshots and outcomes after execution cleanup."""
 
 from __future__ import annotations
 
@@ -23,22 +23,15 @@ from types import SimpleNamespace
 import pytest
 from pydantic_ai.models.test import TestModel
 
-from rpent.cli.main import _build_argparser
-from rpent.cli.task_capture import end_api_task, start_api_task
 from rpent.dashboard.events import NullDashboardEventSink
 from rpent.planner.api_loop import ApiAgentLoop
 from rpent.planner.base import PlannerResult
-from rpent.robots.robot_spec import RunConfig
 from rpent.session import EnvState, Payload
+from rpent.session.capture import end_api_task, start_api_task
 
 
-@pytest.mark.parametrize("record_trajectory", [False, True])
-def test_api_trajectory_capture_requires_explicit_cli_opt_in(
-    tmp_path, record_trajectory
-):
-    args = _build_argparser().parse_args(
-        ["--record-trajectory"] if record_trajectory else []
-    )
+@pytest.mark.parametrize("capture_enabled", [False, True])
+def test_api_trajectory_capture_records_only_started_tasks(tmp_path, capture_enabled):
     state = EnvState(tmp_path)
     toolkit = SimpleNamespace(
         state=state,
@@ -46,10 +39,17 @@ def test_api_trajectory_capture_requires_explicit_cli_opt_in(
         resume_calls=lambda: None,
         cancel_active_and_wait=lambda: None,
     )
-    config = RunConfig("test", tmp_path, {}, {"suite": "libero_object", "task": 3})
-    captured = start_api_task(toolkit, args, config, "Move the cup.")
-    assert (captured is state) is record_trajectory
-    args.max_tokens = 1
+    config = {
+        "arguments": {"record_trajectory": capture_enabled, "max_tokens": 8192},
+        "run": {"output_dir": tmp_path},
+    }
+    captured = (
+        start_api_task(state, instruction="Move the cup.", config=config)
+        if capture_enabled
+        else None
+    )
+    assert (captured is state) is capture_enabled
+    config["arguments"]["max_tokens"] = 1
     result = ApiAgentLoop(
         model=TestModel(call_tools=[], custom_output_text="Done."),
         dashboard_events=NullDashboardEventSink(),
@@ -69,7 +69,7 @@ def test_api_trajectory_capture_requires_explicit_cli_opt_in(
         environment_success=False,
         exception=None,
     )
-    if record_trajectory:
+    if capture_enabled:
         task = state.get_task()
         assert task.status == "completed" and task.stop_reason == "model_output"
         assert task.instruction == "Move the cup."
@@ -88,24 +88,6 @@ def test_api_trajectory_capture_requires_explicit_cli_opt_in(
         assert state.get_task() is None
         assert state.planner_records() == []
         assert not (tmp_path / "trajectories").exists()
-
-
-@pytest.mark.parametrize("planner", ["claude_code", "codex", "flash"])
-def test_recording_flag_does_not_enable_capture_for_other_planners(tmp_path, planner):
-    args = _build_argparser().parse_args(["--planner", planner, "--record-trajectory"])
-    state = EnvState(tmp_path)
-    config = RunConfig("test", tmp_path, {}, {})
-    captured = start_api_task(SimpleNamespace(state=state), args, config, "Move.")
-    assert captured is None
-    assert state.get_task() is None
-    end_api_task(
-        captured,
-        None,
-        finish_result=None,
-        environment_success=None,
-        exception=RuntimeError("planner failed"),
-    )
-    assert not (tmp_path / "trajectories").exists()
 
 
 @pytest.mark.parametrize(

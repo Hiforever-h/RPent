@@ -181,7 +181,7 @@ class RoboTwinEnvFacade(BaseEnvFacade):
 
     def step(
         self, action, *, action_type: RoboTwinActionType = "qpos", capture: bool = False
-    ) -> tuple[Any, Any, Any, Any, dict[str, Any]] | dict[str, Any]:
+    ) -> tuple[Any, Any, Any, Any, dict[str, Any]]:
         expected_dim = 14 if action_type == "qpos" else 16
         array = np.asarray(action, dtype=np.float64)
         if array.shape != (expected_dim,):
@@ -193,16 +193,13 @@ class RoboTwinEnvFacade(BaseEnvFacade):
         observation, reward, terminated, truncated, info = self._env.step(
             array, action_type=action_type, capture=capture
         )
-        result = (
+        return (
             self._strip_single_env_observation(observation),
             self._strip_single_signal(reward, "reward"),
             bool(self._strip_single_signal(terminated, "terminated")),
             bool(self._strip_single_signal(truncated, "truncated")),
             info,
         )
-        if capture:
-            return {"result": result, **info.pop("capture")}
-        return result
 
     def chunk_step(
         self,
@@ -211,7 +208,7 @@ class RoboTwinEnvFacade(BaseEnvFacade):
         action_type: RoboTwinActionType = "qpos",
         return_all_frames: bool = False,
         capture: bool = False,
-    ) -> tuple[Any, Any, Any, Any, dict[str, Any]] | dict[str, Any]:
+    ) -> tuple[Any, Any, Any, Any, dict[str, Any]]:
         expected_dim = 14 if action_type == "qpos" else 16
         array = np.asarray(actions, dtype=np.float64)
         if array.ndim != 2 or array.shape[0] < 1 or array.shape[1] != expected_dim:
@@ -241,16 +238,13 @@ class RoboTwinEnvFacade(BaseEnvFacade):
             }
         else:
             observation = self._strip_single_env_observation(observation)
-        result = (
+        return (
             observation,
             np.asarray(rewards)[0],
             np.asarray(terminated, dtype=bool)[0],
             np.asarray(truncated, dtype=bool)[0],
             info_list[0],
         )
-        if capture:
-            return {"result": result, **info_list[0].pop("capture")}
-        return result
 
     def render_camera(self, camera_name: str, depth: bool = False) -> Any:
         return self._env.render_camera(camera_name, depth=depth, env_id=0)

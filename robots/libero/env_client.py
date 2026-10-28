@@ -60,22 +60,18 @@ class LiberoEnvClient(BaseEnvClient):
         self.truncated = False
         return self.last_obs, info
 
-    def step(self, action, *, capture: bool = False) -> tuple | dict:
+    def step(self, action) -> tuple[dict, Any, np.ndarray, Any, Any]:
         assert not (self.terminated or self.truncated), (
             "env.step called after the episode signaled term/trunc"
         )
-        ret = super().step(action, capture=capture)
-        _, _, term, trunc, _ = ret["result"] if capture else ret
+        ret = super().step(action)
+        _, _, term, trunc, _ = ret
         self.check_done(term, trunc)
         return ret
 
     def chunk_step(
-        self,
-        actions,
-        *,
-        return_all_frames: bool | None = None,
-        capture: bool = False,
-    ) -> tuple | dict:
+        self, actions, *, return_all_frames: bool | None = None
+    ) -> tuple[Any, Any, Any, Any, Any]:
         """Run an action chunk in one RPC. Returns the 5-positional tuple
         ``(obs_or_list, reward, terminated, truncated, info)``.
 
@@ -83,7 +79,6 @@ class LiberoEnvClient(BaseEnvClient):
         (one entry per chunk step), otherwise the final ``Obs`` dict.
         Terminated / truncated have shape ``[chunk_size]`` after the
         server strips the env dim.
-        ``capture=True`` adds execution details around this result.
         """
         assert not (self.terminated or self.truncated), (
             "env.chunk_step called after the episode signaled term/trunc"
@@ -93,9 +88,8 @@ class LiberoEnvClient(BaseEnvClient):
         ret = super().chunk_step(
             actions,
             return_all_frames=return_all_frames,
-            capture=capture,
         )
-        _, _, term, trunc, _ = ret["result"] if capture else ret
+        _, _, term, trunc, _ = ret
         self.check_done(term, trunc)
         return ret
 

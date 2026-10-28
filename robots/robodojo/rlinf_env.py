@@ -202,34 +202,11 @@ class RoboDojoAgentEnv(RoboDojoEnv):
         if not capture:
             return result
 
-        def observation_payload(obs):
-            return {
-                "format": "robodojo.observation",
-                "data": obs,
-                "completeness": "complete",
-                "inline_array_paths": tuple(f"/state/{key}" for key in obs["state"]),
-            }
-
-        obs, reward, done, info = result
         return {
             "result": result,
-            "before_observation": observation_payload(before),
-            "steps": [
-                {
-                    "action": {
-                        "format": f"robodojo.action.{action_type}",
-                        "data": flat_action,
-                        "completeness": "complete",
-                        "inline_array_paths": tuple(f"/{key}" for key in flat_action),
-                    },
-                    "after_observation": observation_payload(obs),
-                    "result": {
-                        "format": "robodojo.step_result",
-                        "data": {"reward": reward, "done": done, "info": info},
-                        "completeness": "complete",
-                    },
-                }
-            ],
+            "before_observation": before,
+            "action": flat_action,
+            "action_type": action_type,
         }
 
     # ---- RoboDojo-specific RPC ----

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Capture API model calls, tool outcomes, and environment actions in EnvState."""
+"""Capture API tasks, model calls, tool outcomes, and environment actions."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from importlib.metadata import version
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 from pydantic import TypeAdapter
@@ -34,10 +34,90 @@ from pydantic_ai.settings import ModelSettings
 from pydantic_core import to_jsonable_python
 
 from rpent.session import EnvState, MissingInfo, Payload
+from rpent.utils.logging import get_logger
+
+if TYPE_CHECKING:
+    from rpent.planner.base import PlannerResult
+
+logger = get_logger("task_capture")
 
 SDK_VERSION = version("pydantic-ai-slim")
 _REQUEST_PARAMETERS = TypeAdapter(ModelRequestParameters)
 _SDK_VALUES = TypeAdapter(Any)
+
+
+def start_api_task(
+    state: EnvState, *, instruction: str, config: dict[str, Any]
+) -> EnvState:
+    """Open API capture with a serializable snapshot of the execution config."""
+    state.start_task(
+        instruction=instruction,
+        config=Payload(
+            format="rpent.task_config",
+            format_version="1",
+            data=to_jsonable_python(config),
+            completeness="complete",
+        ),
+    )
+    return state
+
+
+def end_api_task(
+    state: EnvState | None,
+    result: PlannerResult | None,
+    *,
+    finish_result: dict | None,
+    environment_success: bool | None,
+    exception: BaseException | None,
+    cancelled_reason: str | None = None,
+) -> None:
+    """Close capture after toolkit cleanup, keeping outcome separate from success."""
+    if state is None:
+        return
+    error = result.error if result is not None else None
+    reason = getattr(result, "stop_reason", None)
+    if exception is not None:
+        error = f"{type(exception).__name__}: {exception}"
+        status = (
+            "cancelled"
+            if isinstance(exception, (KeyboardInterrupt, asyncio.CancelledError))
+            else "failed"
+        )
+        reason = "operator" if status == "cancelled" else "execution_error"
+    elif cancelled_reason is not None:
+        status, reason = "cancelled", cancelled_reason
+    elif (finish_result or {}).get("operator_aborted"):
+        status, reason = "cancelled", "operator"
+    elif (finish_result or {}).get("operator_finished"):
+        status, reason = "completed", "operator_finished"
+    elif reason == "cancelled":
+        status = "cancelled"
+    elif error is not None or result is None:
+        status, reason = "failed", reason or "planner_error"
+    else:
+        status = "completed"
+        reason = reason or ("finish" if finish_result is not None else "model_output")
+    state.end_task(
+        status=status,
+        stop_reason=reason,
+        result=Payload(
+            format="rpent.task_result",
+            format_version="1",
+            data={
+                "finish_result": finish_result,
+                "environment_success": environment_success,
+                "stats": result.stats if result is not None else {},
+                "error": error,
+            },
+            completeness="complete",
+        ),
+    )
+    try:
+        path = state.save_planner_trajectory()
+    except Exception:
+        logger.exception("Failed to save planner trajectory")
+    else:
+        logger.info("Planner trajectory saved to %s", path)
 
 
 class ToolCallCapture:
@@ -102,11 +182,42 @@ current_tool_call: ContextVar[ToolCallCapture | None] = ContextVar(
 
 
 class CapturingEnvClient:
-    """Record executed environment actions for the current API tool call."""
+    """Record executed environment actions for the current API tool call.
 
-    def __init__(self, wrapped: Any, state: EnvState) -> None:
+    During capture, ``capture_call(method, *args, **kwargs)`` executes the
+    operation and returns the structure below. Without a callback, the wrapped
+    client's method is called with ``capture=True`` and must return it directly::
+
+        {
+            "result": original_result,
+            "before_observation": observation_payload,
+            "steps": [
+                {
+                    "action": action_payload,
+                    "after_observation": observation_payload,
+                    "result": result_payload,
+                }
+            ],
+        }
+
+    Payloads use ``session.records.Payload`` fields, including ``format`` and
+    ``data``. Steps contain only confirmed actions in execution order, with
+    independent observation snapshots; each step's after-observation is the next
+    step's before-observation. This client assigns record IDs, saves payloads,
+    and returns ``result`` to the caller. Without an active capture for this
+    state, calls go directly to the wrapped client.
+    """
+
+    def __init__(
+        self,
+        wrapped: Any,
+        state: EnvState,
+        *,
+        capture_call: Callable[..., dict[str, Any]] | None = None,
+    ) -> None:
         self.wrapped = wrapped
         self.state = state
+        self._capture_call = capture_call
         self._observation_id: str | None = None
 
     def __getattr__(self, name: str) -> Any:
@@ -119,11 +230,11 @@ class CapturingEnvClient:
 
     def step(self, *args: Any, **kwargs: Any) -> Any:
         """Execute and record one action, returning the original client result."""
-        return self._execute(self.wrapped.step, *args, **kwargs)
+        return self._execute("step", *args, **kwargs)
 
     def chunk_step(self, *args: Any, **kwargs: Any) -> Any:
         """Execute and record an action batch, returning the original client result."""
-        return self._execute(self.wrapped.chunk_step, *args, **kwargs)
+        return self._execute("chunk_step", *args, **kwargs)
 
     @contextmanager
     def prediction(self, instruction: str) -> Iterator[str | None]:
@@ -143,13 +254,20 @@ class CapturingEnvClient:
         finally:
             capture.prediction_id = previous
 
-    def _execute(self, operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    def _execute(
+        self, method: Literal["step", "chunk_step"], *args: Any, **kwargs: Any
+    ) -> Any:
+        operation = getattr(self.wrapped, method)
         capture = current_tool_call.get()
         if capture is None or capture.state is not self.state:
             self._observation_id = None
             return operation(*args, **kwargs)
         try:
-            response = operation(*args, capture=True, **kwargs)
+            response = (
+                self._capture_call(method, *args, **kwargs)
+                if self._capture_call is not None
+                else operation(*args, capture=True, **kwargs)
+            )
         except BaseException as exc:
             self._observation_id = None
             self.state.update_tool_call(

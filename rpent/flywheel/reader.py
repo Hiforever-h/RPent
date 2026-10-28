@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Read schema-v3/v4 trajectory records, loading attachments on demand."""
+"""Read schema-v3/v4/v5 trajectory records, loading attachments on demand."""
 
 from __future__ import annotations
 
@@ -57,8 +57,11 @@ def iter_trajectories(
         if not isinstance(document, dict) or document.get("schema_version") not in (
             3,
             4,
+            5,
         ):
-            raise ValueError(f"{task_path}: expected trajectory schema_version 3 or 4")
+            raise ValueError(
+                f"{task_path}: expected trajectory schema_version 3, 4 or 5"
+            )
         if not isinstance(document.get("task"), dict):
             raise ValueError(f"{task_path}: expected a task object")
 
@@ -86,6 +89,29 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
                 raise ValueError(f"{path}:{line_number}: expected a record object")
             records.append(record)
     return records
+
+
+def validate_image(
+    value: dict[str, Any] | None,
+    name: str,
+    *,
+    expected_shape: tuple[int, int, int] | None = None,
+) -> None:
+    """Check uint8 HWC image metadata without loading image files."""
+    value = value or {}
+    shape = value.get("shape", [])
+    if (
+        value.get("$type") not in ("ndarray", "artifact_ref")
+        or len(shape) != 3
+        or shape[-1] != 3
+        or (expected_shape is not None and tuple(shape) != expected_shape)
+        or value.get("dtype") != "uint8"
+    ):
+        raise ValueError(f"Invalid {name} metadata")
+    if value["$type"] == "artifact_ref" and (
+        value.get("kind") != "ndarray" or not value.get("path")
+    ):
+        raise ValueError(f"Invalid {name} artifact reference")
 
 
 def read_array(trajectory_root: Path | str, value: dict[str, Any]) -> np.ndarray:

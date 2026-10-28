@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -202,6 +203,58 @@ def test_records_executed_steps_and_reuses_observations(env, capture):
     assert tool.missing == {}
 
 
+@pytest.mark.parametrize(
+    ("method", "values", "kwargs", "expected_actions"),
+    [
+        ("step", [2], {"action_type": "ee"}, [[2]]),
+        ("chunk_step", [[1], [2]], {"return_all_frames": True}, [[1], [2]]),
+    ],
+)
+def test_custom_capture_records_actions_and_predictions(
+    capture, method, values, kwargs, expected_actions
+):
+    client = _Client()
+    methods = []
+
+    def capture_call(method, *args, **kwargs):
+        methods.append(method)
+        getattr(client, method)(*args, **kwargs)
+        return client.last_response
+
+    env = CapturingEnvClient(client, capture.state, capture_call=capture_call)
+    with capture.bind(), env.prediction("Move."):
+        result = getattr(env, method)(values, **kwargs)
+
+    assert methods == [method]
+    assert client.calls == [(method, kwargs)]
+    assert result is client.last_result
+    actions = capture.state.action_records()
+    np.testing.assert_array_equal(
+        [
+            action.action.data["target"] if method == "step" else action.action.data
+            for action in actions
+        ],
+        expected_actions,
+    )
+    assert all(action.source == "vla" for action in actions)
+    (prediction,) = capture.state.prediction_records()
+    assert prediction.action_ids == [action.action_id for action in actions]
+
+
+def test_custom_capture_failure_is_reported_without_retry(capture):
+    client = _Client()
+    capture_call = Mock(side_effect=RuntimeError("capture failed"))
+    env = CapturingEnvClient(client, capture.state, capture_call=capture_call)
+    with capture.bind(), pytest.raises(RuntimeError, match="capture failed"):
+        env.step([1])
+
+    capture_call.assert_called_once_with("step", [1])
+    assert client.calls == []
+    assert capture.state.action_records() == []
+    call = capture.state.get_tool_call(capture.tool_call_id)
+    assert call.missing["after_observation_id"].reason == "capture_failed"
+
+
 def test_observation_reuse_across_tool_calls(env, capture):
     with capture.bind():
         env.step([1])
@@ -294,9 +347,15 @@ def test_interruptions_break_observation_reuse(env, capture, interruption):
     assert tool.missing == {}
 
 
-def test_no_matching_capture_passes_through_without_a_task(capture, tmp_path):
+@pytest.mark.parametrize("custom_capture", [False, True])
+def test_no_matching_capture_passes_through_without_a_task(
+    capture, tmp_path, custom_capture
+):
     state = EnvState(tmp_path / "other")
-    env = CapturingEnvClient(_Client(), state)
+    capture_call = Mock()
+    env = CapturingEnvClient(
+        _Client(), state, capture_call=capture_call if custom_capture else None
+    )
     with env.prediction("Move."):
         assert env.step([1]) is env.wrapped.last_result
     with capture.bind():
@@ -305,6 +364,7 @@ def test_no_matching_capture_passes_through_without_a_task(capture, tmp_path):
                 env.chunk_step([[2]], return_all_frames=True) is env.wrapped.last_result
             )
     assert env.calls == [("step", {}), ("chunk_step", {"return_all_frames": True})]
+    capture_call.assert_not_called()
     assert state.action_records() == []
     assert capture.state.action_records() == []
     assert state.prediction_records() == capture.state.prediction_records() == []

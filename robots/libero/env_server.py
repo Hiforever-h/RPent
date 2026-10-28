@@ -199,32 +199,20 @@ class LiberoEnvFacade(BaseEnvFacade):
         obs = self._strip_obs(to_numpy_tree(obs))
         return obs, to_numpy_tree(info)
 
-    def step(self, action, *, capture: bool = False):
-        before = (
-            self._strip_obs(
-                to_numpy_tree(self._env._wrap_obs(self._env.current_raw_obs))
-            )
-            if capture
-            else None
-        )
+    def step(self, action):
         obs, rew, term, trunc, info = self._env.step(self._expand_action(action))
         obs = self._strip_obs(to_numpy_tree(obs))
         term = self._strip(to_numpy_tree(term))
         trunc = self._strip(to_numpy_tree(trunc))
-        result = (
+        return (
             obs,
             self._strip(to_numpy_tree(rew)),
             term,
             trunc,
             to_numpy_tree(info),
         )
-        if capture:
-            return self._capture_result(result, before, [np.asarray(action)], [result])
-        return result
 
-    def chunk_step(
-        self, actions, *, return_all_frames: bool = False, capture: bool = False
-    ):
+    def chunk_step(self, actions, *, return_all_frames: bool = False):
         """Run a full action chunk in one RPC. ``actions`` shape
         ``[chunk_size, action_dim]`` (single env).
 
@@ -235,78 +223,21 @@ class LiberoEnvFacade(BaseEnvFacade):
         ``terminated`` / ``truncated`` carry shape ``[chunk_size]`` after
         the leading env dim is stripped — the agent reduces across the
         chunk itself.
-        ``capture=True`` adds execution details around this result.
         """
-        before = (
-            self._strip_obs(
-                to_numpy_tree(self._env._wrap_obs(self._env.current_raw_obs))
-            )
-            if capture
-            else None
-        )
         obs_list, rew, term, trunc, info = self._env.chunk_step(
             self._expand_chunk(actions)
         )
         obs_list = [self._strip_obs(to_numpy_tree(o)) for o in obs_list]
         term = self._strip(to_numpy_tree(term))
         trunc = self._strip(to_numpy_tree(trunc))
-        rew = self._strip(to_numpy_tree(rew))
-        info = to_numpy_tree(info)
         obs_field = obs_list if return_all_frames else obs_list[-1]
-        result = (obs_field, rew, term, trunc, info)
-        if capture:
-            return self._capture_result(
-                result,
-                before,
-                np.asarray(actions),
-                zip(obs_list, rew, term, trunc, info),
-            )
-        return result
-
-    @staticmethod
-    def _capture_result(result, before, actions, steps) -> dict:
-        """Attach executed actions and observations without changing the normal result."""
-
-        def observation_payload(obs):
-            return {
-                "format": "libero.observation",
-                "data": obs,
-                "completeness": "complete",
-                "inline_array_paths": ("/states",),
-            }
-
-        return {
-            "result": result,
-            "before_observation": observation_payload(before),
-            "steps": [
-                {
-                    "action": {
-                        "format": "libero.action",
-                        "data": action,
-                        "completeness": "complete",
-                        "inline_array_paths": ("",),
-                    },
-                    "after_observation": observation_payload(obs),
-                    "result": {
-                        "format": "libero.step_result",
-                        "data": {
-                            "reward": reward,
-                            "terminated": term,
-                            "truncated": trunc,
-                            "info": info,
-                        },
-                        "completeness": "complete",
-                        "inline_array_paths": (
-                            "/info/episode/success_once",
-                            "/info/episode/return",
-                            "/info/episode/episode_len",
-                            "/info/episode/reward",
-                        ),
-                    },
-                }
-                for action, (obs, reward, term, trunc, info) in zip(actions, steps)
-            ],
-        }
+        return (
+            obs_field,
+            self._strip(to_numpy_tree(rew)),
+            term,
+            trunc,
+            to_numpy_tree(info),
+        )
 
     def raw_obs(self) -> dict:
         return to_numpy_tree(self._env.current_raw_obs[self._env_idx])

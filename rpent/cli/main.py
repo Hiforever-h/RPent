@@ -42,9 +42,9 @@ import shlex
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import asdict
 from pathlib import Path
 
-from rpent.cli.task_capture import end_api_task, start_api_task
 from rpent.cli.tui import (
     start_first_prompt_resolver,
     start_interactive_reader,
@@ -62,6 +62,7 @@ from rpent.planner.base import (
 )
 from rpent.planner.check import BASE_URL_ENV_BY_PLANNER
 from rpent.robots import enumerate_robots, get_robot_spec, get_toolkit
+from rpent.session.capture import end_api_task, start_api_task
 from rpent.utils.logging import get_logger, init_output_dir
 
 logger = get_logger("agent")
@@ -630,7 +631,12 @@ def main() -> int:
             finish_result = None
             environment_success = None
             try:
-                task_state = start_api_task(toolkit, args, run_config, session_msg)
+                if args.planner == "api" and args.record_trajectory:
+                    task_state = start_api_task(
+                        toolkit.state,
+                        instruction=session_msg,
+                        config={"arguments": vars(args), "run": asdict(run_config)},
+                    )
                 result = planner.solve(
                     system_prompt=system_prompt,
                     user_message=session_msg,

@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 from contextlib import nullcontext
 from copy import deepcopy
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -30,9 +31,10 @@ from robots.robocasa.env_client import RoboCasaEnvClient
 from robots.robocasa.env_server import DEFAULT_CAMS, RoboCasaEnvFacade
 from robots.robocasa.primitives import RoboCasaPrimitives
 from robots.robocasa.prompt_bundle import system_prompt
+from robots.robocasa.toolkit import _capture_robocasa_call
 from robots.robocasa.vla_server import _normalize_legacy_processor_geometry
 from rpent.dashboard.events import NullDashboardEventSink
-from rpent.data.reader import read_array
+from rpent.flywheel.reader import read_array
 from rpent.memory import MemoryManager
 from rpent.prompt.utils import format_prompt
 from rpent.robots.components.action_spec import box_action_spec
@@ -375,6 +377,46 @@ def facade(monkeypatch):
     return facade
 
 
+def test_capture_robocasa_call_snapshots_native_step(
+    facade, transport, make_server_and_client
+):
+    with make_server_and_client(facade, transport) as rpc:
+        client = RoboCasaEnvClient(rpc, expected_meta=facade._meta)
+        initial_obs = client.last_obs
+        action = np.arange(12, dtype=np.float32).reshape(3, 4) / 10
+        response = _capture_robocasa_call(client, "step", action)
+        obs, reward, done, info = response["result"]
+        assert obs is client.last_obs
+        assert (reward, done, info) == (1.0, False, {"count": 1})
+        (step,) = response["steps"]
+        assert step["action"]["data"].dtype == np.float64
+        np.testing.assert_array_equal(step["action"]["data"], facade.env.executed[0])
+        assert step["result"]["data"] == {
+            "reward": reward,
+            "done": done,
+            "info": info,
+        }
+
+        client.step(np.zeros(12))
+        for payload, count in (
+            (response["before_observation"], 0),
+            (step["after_observation"], 1),
+        ):
+            np.testing.assert_array_equal(
+                payload["data"]["robot0_eef_pos"], [count] * 3
+            )
+            assert "/robot0_eef_pos" in payload["inline_array_paths"]
+            assert set(payload["data"]["images"]) == set(DEFAULT_CAMS)
+            for image in payload["data"]["images"].values():
+                assert image.shape == (4, 4, 3)
+                np.testing.assert_array_equal(
+                    image[:, 0, 0], np.arange(4)[::-1] + count * 10
+                )
+        assert all(
+            "images" not in value for value in (initial_obs, obs, client.last_obs)
+        )
+
+
 def _primitives(env, tmp_path):
     primitives = RoboCasaPrimitives(env, tmp_path, 4, _VLA(), allow_reset=False)
     skill = primitives._rldx
@@ -435,7 +477,13 @@ def test_robocasa_tools_capture_executed_actions_and_rldx_history(
 
     with make_server_and_client(facade, transport) as rpc:
         client = RoboCasaEnvClient(rpc, expected_meta=facade._meta)
-        env = client if mode == "unwrapped" else CapturingEnvClient(client, state)
+        env = (
+            client
+            if mode == "unwrapped"
+            else CapturingEnvClient(
+                client, state, capture_call=partial(_capture_robocasa_call, client)
+            )
+        )
         primitives = _primitives(env, tmp_path)
         assert primitives._rldx.env is env
         toolkit.add_tools(iter_tools(primitives))
@@ -461,7 +509,7 @@ def test_robocasa_tools_capture_executed_actions_and_rldx_history(
         assert "images" not in client.last_obs
     assert facade.env.reset_count == 2
     assert len(facade.env.executed) == 7
-    assert facade.env.observation_reads == (7 if recording else 0)
+    assert facade.env.observation_reads == 0
     np.testing.assert_allclose(facade.env.executed[1][7:11], [0.1, -0.1, 0.1, -0.1])
     assert [a[6] for a in facade.env.executed[1:5]] == [-1, 1, -1, 1]
     inputs = primitives._rldx._vla_client.inputs
@@ -548,8 +596,9 @@ def test_robocasa_failed_step_keeps_prior_steps_and_ends_prediction_scope(
     )
     capture = ToolCallCapture(state, tool_id)
     with make_server_and_client(facade, transport) as rpc:
+        client = RoboCasaEnvClient(rpc, expected_meta=facade._meta)
         env = CapturingEnvClient(
-            RoboCasaEnvClient(rpc, expected_meta=facade._meta), state
+            client, state, capture_call=partial(_capture_robocasa_call, client)
         )
         primitives = _primitives(env, tmp_path)
         facade.env.fail_at = 2
@@ -563,5 +612,3 @@ def test_robocasa_failed_step_keeps_prior_steps_and_ends_prediction_scope(
     first, last = state.action_records()
     assert first.source == "vla" and last.source == "tool_computed"
     assert last.before_observation_id != first.after_observation_id
-    before = state.get_observation(last.before_observation_id)
-    np.testing.assert_array_equal(before.payload.data["robot0_eef_pos"], [2] * 3)

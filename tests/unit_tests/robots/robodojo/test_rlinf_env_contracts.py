@@ -25,9 +25,10 @@ import pytest
 from robots.robodojo import env_server
 from robots.robodojo.env_client import RoboDojoEnvClient
 from robots.robodojo.env_facade import RoboDojoEnvFacade
-from robots.robodojo.toolkit import RoboDojoToolkit
+from robots.robodojo.flywheel import read_frame
+from robots.robodojo.toolkit import RoboDojoToolkit, _capture_robodojo_call
 from rpent.dashboard.events import NullDashboardEventSink
-from rpent.data.reader import read_array
+from rpent.flywheel.reader import read_array
 from rpent.memory import MemoryManager
 from rpent.session import Payload
 from rpent.session.capture import ToolCallCapture
@@ -244,19 +245,14 @@ def test_native_capture_preserves_execution_observations_and_video(
     assert len(scene.frames) == len(scene.executed) == 1
     if not capture:
         return
-    (step,) = response["steps"]
     native_action, native_type = scene.executed[0]
-    assert native_type == action_type
-    assert step["action"]["format"] == f"robodojo.action.{action_type}"
+    assert response["action_type"] == native_type == action_type
     for key, value in native_action.items():
-        np.testing.assert_array_equal(step["action"]["data"][key], value)
-    assert step["result"]["data"] == {"reward": reward, "done": done, "info": info}
-    for payload, value in (
+        np.testing.assert_array_equal(response["action"][key], value)
+    for data, value in (
         (response["before_observation"], 0),
-        (step["after_observation"], 1),
+        (obs, 1),
     ):
-        data = payload["data"]
-        assert payload["format"] == "robodojo.observation"
         assert data["instruction"] == "pick bottle"
         assert ("score" in data) is not eval_fair
         for camera in data["vision"].values():
@@ -286,8 +282,8 @@ def test_camera_sync_is_limited_to_captured_steps(
     response = scene.agent.step_native(np.zeros(14), capture=capture)
     assert len(scene.executed) == len(scene.frames) == 1
     if capture:
-        before = response["before_observation"]["data"]
-        after = response["steps"][0]["after_observation"]["data"]
+        before = response["before_observation"]
+        after = response["result"][0]
         for obs, value in ((before, 0), (after, 1), (scene.frames[0], 1)):
             for camera in obs["vision"].values():
                 np.testing.assert_array_equal(
@@ -299,6 +295,60 @@ def test_camera_sync_is_limited_to_captured_steps(
     reads = 0
     scene.agent.get_obs()
     assert reads == 1
+
+
+@pytest.mark.parametrize(
+    ("eval_fair", "action_kind"),
+    [(False, "vector"), (False, "joint"), (True, "vector"), (True, "ee")],
+)
+def test_capture_call_preserves_native_action_and_observations(
+    scene, eval_fair, action_kind, transport, make_server_and_client
+):
+    scene.agent.eval_fair = eval_fair
+    scene.agent.meta["mode"] = "eval-fair" if eval_fair else "dev"
+    facade = RoboDojoEnvFacade(scene.agent)
+
+    if action_kind == "vector":
+        command = np.arange(14)
+    elif action_kind == "joint":
+        command = {
+            "left_arm_joint_state": np.arange(6, dtype=np.float32),
+            "right_ee_joint_state": np.array([0.4], dtype=np.float64),
+        }
+    else:
+        command = {"left_ee_pose": np.array([0, 0, 0.9, 1, 0, 0, 0])}
+    action_type = "ee" if action_kind == "ee" else "joint"
+    with make_server_and_client(facade, transport) as rpc:
+        client = RoboDojoEnvClient(rpc, expected_meta=scene.agent.get_env_meta())
+        if eval_fair:
+            assert not hasattr(client, "last_obs")
+        frame_count = len(scene.frames)
+        response = _capture_robodojo_call(client, "step", command)
+    obs, reward, done, info = response["result"]
+    assert reward == (0.0 if eval_fair else 0.5)
+    assert done is False
+    assert info["status"] == {"step": 1, "step_limit": 99}
+    np.testing.assert_equal(client.last_obs, obs)
+    assert len(scene.frames) == frame_count + 1
+    ((native_action, native_type),) = scene.executed
+    (step,) = response["steps"]
+    assert native_type == action_type
+    assert step["action"]["format"] == f"robodojo.action.{action_type}"
+    np.testing.assert_equal(step["action"]["data"], native_action)
+    for key, value in native_action.items():
+        assert step["action"]["data"][key].dtype == value.dtype
+    assert step["result"]["format"] == "robodojo.step_result"
+    assert step["result"]["data"] == {"reward": reward, "done": done, "info": info}
+    np.testing.assert_equal(step["after_observation"]["data"], obs)
+    for payload, value in (
+        (response["before_observation"], 0),
+        (step["after_observation"], 1),
+    ):
+        assert payload["format"] == "robodojo.observation"
+        assert ("score" in payload["data"]) is not eval_fair
+        for camera in payload["data"]["vision"].values():
+            assert camera["color"].dtype == np.uint8
+            np.testing.assert_array_equal(camera["color"], np.full((2, 2, 3), value))
 
 
 @pytest.mark.parametrize("recording", [False, True])
@@ -372,17 +422,28 @@ def test_toolkit_saves_only_executed_predictions_and_restores_source(
         assert action["action"]["format"] == f"robodojo.action.{action_type}"
         for key, value in native.items():
             saved = action["action"]["data"][key]
-            np.testing.assert_array_equal(
-                read_array(root, saved) if isinstance(value, np.ndarray) else saved,
-                value,
-            )
+            if isinstance(value, np.ndarray):
+                saved = read_array(root, saved)
+                assert saved.dtype == value.dtype
+            np.testing.assert_array_equal(saved, value)
         assert action["before_observation_id"] == f"O{index + 1}"
         assert action["after_observation_id"] == f"O{index + 2}"
         for side, count in (("before", index), ("after", index + 1)):
             obs = action[f"{side}_observation"]["payload"]["data"]
             for camera in obs["vision"].values():
+                image = read_array(root, camera["color"])
+                assert image.dtype == np.uint8
+                np.testing.assert_array_equal(image, np.full((2, 2, 3), count))
+        if action_type == "joint":
+            frame = read_frame(root, action, "pick bottle")
+            np.testing.assert_array_equal(frame["action"], commands[index % 3])
+            np.testing.assert_array_equal(
+                frame["observation.state"], np.r_[np.zeros(12), 0.2, 0.2]
+            )
+            assert frame["prompt"] == "pick bottle"
+            for camera in ("cam_high", "cam_left_wrist", "cam_right_wrist"):
                 np.testing.assert_array_equal(
-                    read_array(root, camera["color"]), np.full((2, 2, 3), count)
+                    frame[f"observation.images.{camera}"], np.full((2, 2, 3), index)
                 )
     actions_by_id = {action["action_id"]: action for action in actions}
     for prediction, expected in zip(predictions, inputs, strict=True):
@@ -398,3 +459,51 @@ def test_toolkit_saves_only_executed_predictions_and_restores_source(
                 np.testing.assert_array_equal(
                     read_array(root, obs["vision"][name][key]), value
                 )
+
+
+def test_failed_step_keeps_only_confirmed_prediction_actions(
+    scene, tmp_path, monkeypatch, transport, make_server_and_client
+):
+    from rpent.utils import logging
+
+    monkeypatch.setattr(logging, "_output_dir", tmp_path)
+    apply_action = scene.agent._sub_env().apply_action
+
+    def fail_after_second_action(action, action_type, *, eval_fair):
+        apply_action(action, action_type, eval_fair=eval_fair)
+        if scene.take_action_cnt[0] == 2:
+            raise RuntimeError("native step failed")
+
+    monkeypatch.setattr(
+        scene.agent._sub_env(), "apply_action", fail_after_second_action
+    )
+    with make_server_and_client(RoboDojoEnvFacade(scene.agent), transport) as rpc:
+        client = RoboDojoEnvClient(rpc, expected_meta=scene.agent.get_env_meta())
+        toolkit = RoboDojoToolkit(
+            primitives_kwargs={
+                "env": client,
+                "vla_client": SimpleNamespace(predict=lambda obs: np.zeros((3, 14))),
+            },
+            dashboard_events=NullDashboardEventSink(),
+            memory=MemoryManager(tmp_path / "memory"),
+        )
+        state = toolkit.state
+        state.start_task(instruction="pick bottle", config=Payload("json", {}))
+        tool_id = state.register_tool_call(
+            planner_id=state.register_planner(backend="api"),
+            name="pi0_pick",
+            arguments=Payload("json", {}),
+        )
+        with ToolCallCapture(state, tool_id).bind():
+            result = toolkit.execute_tool("pi0_pick", {})
+
+    assert result.is_error
+    assert len(scene.executed) == 2
+    (action,) = state.action_records()
+    (prediction,) = state.prediction_records()
+    assert action.source == "vla"
+    assert prediction.action_ids == [action.action_id]
+    assert action.tool_call_id == prediction.tool_call_id == tool_id
+    call = state.get_tool_call(tool_id)
+    assert call.missing["after_observation_id"].reason == "capture_failed"
+    assert "native step failed" in call.missing["after_observation_id"].detail

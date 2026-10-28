@@ -777,7 +777,13 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
 
 @pytest.mark.parametrize(
     ("planner_name", "record_trajectory"),
-    [("api", False), ("api", True), ("codex", True), ("flash", True)],
+    [
+        ("api", False),
+        ("api", True),
+        ("claude_code", True),
+        ("codex", True),
+        ("flash", True),
+    ],
 )
 @pytest.mark.parametrize(
     "planner_error", [None, "RuntimeError: Grasp not held; replay stopped"]
@@ -845,8 +851,12 @@ def test_full_cli_calls_robot_result_finalizer_without_robot_special_case(
             assert task.status == ("failed" if planner_error else "completed")
             assert task.result.data["environment_success"] is False
             assert task.instruction == "task\n"
+            assert task.config.data["arguments"]["planner"] == "api"
+            assert task.config.data["arguments"]["record_trajectory"] is True
+            assert task.config.data["run"]["output_dir"] == str(tmp_path)
         else:
             assert robot_toolkit.state.get_task() is None
+            assert not (tmp_path / "state" / "trajectories").exists()
         return write_json_atomic(
             context.output_dir / "result.json",
             {

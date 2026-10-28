@@ -99,26 +99,13 @@ class BaseEnvFacade(RpcFacade):
     def step(self, *args: Any, capture: bool = False, **kwargs: Any) -> Any:
         """Execute one action and optionally return execution details.
 
-        Without capture, return the existing gym tuple. With capture, return::
+        Without capture, return the existing gym tuple. Backends supporting
+        capture return a dictionary with the original tuple under ``result``
+        and backend-specific execution details. A toolkit capture callback
+        converts raw details into recording payloads; backends that already
+        return recording payloads can be used without a callback.
 
-            {
-                "result": original_result,
-                "before_observation": observation_payload,
-                "steps": [
-                    {
-                        "action": action_payload,
-                        "after_observation": observation_payload,
-                        "result": result_payload,
-                    }
-                ],
-            }
-
-        Payloads are dictionaries using ``session.records.Payload`` fields,
-        including ``format`` and ``data``. Steps contain only executed actions,
-        in execution order, with independent observation snapshots; each step's
-        after-observation is the next step's before-observation. Subclasses
-        supply these details without allocating record IDs. Failed calls raise
-        normally and return no partial details.
+        Failed calls raise normally and return no partial details.
         """
         raise NotImplementedError
 

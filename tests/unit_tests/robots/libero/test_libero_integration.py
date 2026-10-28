@@ -14,6 +14,7 @@
 
 import json
 from contextlib import nullcontext
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -22,7 +23,6 @@ import pytest
 from pydantic_ai.models.function import DeltaToolCall, FunctionModel
 
 from robots.libero import toolkit as libero_toolkit
-from robots.libero.env_server import LiberoEnvFacade
 from robots.libero.tools import LiberoPrimitives
 from rpent.dashboard.events import NullDashboardEventSink
 from rpent.memory import MemoryManager
@@ -79,34 +79,78 @@ class _Env:
             [{} for _ in actions],
         )
 
-    def step(self, action, *, capture=False):
-        before = self.last_obs
+    def step(self, action):
         result = self._step(action)
         self.last_obs = result[0]
-        if capture:
-            return LiberoEnvFacade._capture_result(
-                result, before, [np.asarray(action)], [result]
-            )
         return result
 
-    def chunk_step(self, actions, *, return_all_frames=None, capture=False):
+    def chunk_step(self, actions, *, return_all_frames=None):
         self.chunk_return_all_frames = return_all_frames
-        before = self.last_obs
         all_frames = (
             self.return_all_frames if return_all_frames is None else return_all_frames
         )
-        result = self._chunk_step(actions, return_all_frames=all_frames or capture)
-        obs, rewards, term, trunc, infos = result
-        self.last_obs = obs[-1] if all_frames or capture else obs
-        if not capture:
-            return result
-        native_result = (obs if all_frames else obs[-1], rewards, term, trunc, infos)
-        return LiberoEnvFacade._capture_result(
-            native_result,
-            before,
-            np.asarray(actions),
-            zip(obs, rewards, term, trunc, infos),
+        result = self._chunk_step(actions, return_all_frames=all_frames)
+        self.last_obs = result[0][-1] if all_frames else result[0]
+        return result
+
+
+def test_capture_libero_call_step():
+    env = _Env()
+    env.step = Mock(wraps=env.step)
+    action = np.linspace(-1, 1, 7).tolist()
+    before = env.last_obs
+
+    response = libero_toolkit._capture_libero_call(env, "step", action)
+
+    env.step.assert_called_once_with(action)
+    assert response["before_observation"]["data"] is before
+    result = response["result"]
+    assert len(result) == 5
+    assert result[0] is env.last_obs
+    (step,) = response["steps"]
+    np.testing.assert_array_equal(step["action"]["data"], action)
+    assert step["after_observation"]["data"] is result[0]
+    assert step["result"]["data"] == {
+        "reward": 0,
+        "terminated": False,
+        "truncated": False,
+        "info": {},
+    }
+
+
+@pytest.mark.parametrize("default_all_frames", [False, True])
+@pytest.mark.parametrize("return_all_frames", [None, False, True])
+def test_capture_libero_call_chunk(default_all_frames, return_all_frames):
+    env = _Env()
+    env.return_all_frames = default_all_frames
+    env.chunk_step = Mock(wraps=env.chunk_step)
+    actions = np.linspace(-1, 1, 21).reshape(3, 7).tolist()
+    before = env.last_obs
+
+    response = libero_toolkit._capture_libero_call(
+        env, "chunk_step", actions, return_all_frames=return_all_frames
+    )
+
+    env.chunk_step.assert_called_once_with(actions, return_all_frames=True)
+    assert response["before_observation"]["data"] is before
+    obs, rewards, term, trunc, infos = response["result"]
+    all_frames = default_all_frames if return_all_frames is None else return_all_frames
+    assert isinstance(obs, list) is all_frames
+    assert (obs[-1] if all_frames else obs) is env.last_obs
+    assert len(response["steps"]) == len(actions)
+    for index, step in enumerate(response["steps"]):
+        np.testing.assert_array_equal(step["action"]["data"], actions[index])
+        np.testing.assert_array_equal(
+            step["after_observation"]["data"]["states"], np.full(8, index + 2)
         )
+        if all_frames:
+            assert step["after_observation"]["data"] is obs[index]
+        assert step["result"]["data"] == {
+            "reward": rewards[index],
+            "terminated": term[index],
+            "truncated": trunc[index],
+            "info": infos[index],
+        }
 
 
 class _Model:
@@ -326,7 +370,12 @@ def captured_primitives(tmp_path):
     )
     capture = ToolCallCapture(state, tool_call_id)
     capture.start()
-    primitives = _primitives(CapturingEnvClient(_Env(), state))
+    env = _Env()
+    primitives = _primitives(
+        CapturingEnvClient(
+            env, state, capture_call=partial(libero_toolkit._capture_libero_call, env)
+        )
+    )
     primitives.reset()
     return primitives, capture
 
@@ -424,7 +473,7 @@ def test_vla_capture_keeps_all_confirmed_actions(
         else:
             primitives._vlm_chunk("pick up the bowl")
 
-    assert primitives.env.chunk_return_all_frames is (True if frame_failure else None)
+    assert primitives.env.chunk_return_all_frames is True
     actions = capture.state.action_records()
     assert [action.source for action in actions] == ["vla", "vla"]
     assert actions[0].after_observation_id == actions[1].before_observation_id
@@ -549,12 +598,19 @@ def test_unexecuted_vla_actions_are_not_recorded(
 @pytest.mark.parametrize("capture_actions", [False, True])
 def test_no_capture_context_keeps_fast_chunk_path(capture_actions, tmp_path):
     env = _Env()
+    state = EnvState(tmp_path)
     primitives = _primitives(
-        CapturingEnvClient(env, EnvState(tmp_path)) if capture_actions else env
+        CapturingEnvClient(
+            env, state, capture_call=partial(libero_toolkit._capture_libero_call, env)
+        )
+        if capture_actions
+        else env
     )
     primitives.reset()
     primitives._vlm_chunk("pick up the bowl")
     assert env.chunk_return_all_frames is None
+    assert state.action_records() == state.prediction_records() == []
+    assert not (tmp_path / "trajectories").exists()
 
 
 @pytest.mark.parametrize("failure", [None, "stop", "save"])
@@ -669,21 +725,17 @@ class _LiberoBackend:
         )
 
 
+@pytest.mark.parametrize("record", [False, True])
 @pytest.mark.parametrize(
-    ("transport", "all_frames", "record"),
-    [
-        ("socket", False, True),
-        ("http", True, True),
-        ("socket", True, False),
-        ("http", False, False),
-    ],
+    ("all_frames", "default_all_frames"),
+    [(False, True), (True, False), (None, False), (None, True)],
 )
 def test_libero_client_facade_capture_and_raw_trajectory_roundtrip(
-    transport, make_server_and_client, tmp_path, all_frames, record
+    transport, make_server_and_client, tmp_path, all_frames, default_all_frames, record
 ):
     from robots.libero.env_client import LiberoEnvClient
     from robots.libero.env_server import LiberoEnvFacade
-    from rpent.data.reader import read_array
+    from rpent.flywheel.reader import read_array
     from rpent.session import EnvState
     from rpent.session.capture import CapturingEnvClient, ToolCallCapture
 
@@ -705,8 +757,14 @@ def test_libero_client_facade_capture_and_raw_trajectory_roundtrip(
         capture = ToolCallCapture(state, tool_id)
     commands = np.linspace(-1, 1, 35, dtype=np.float32).reshape(5, 7)
     with make_server_and_client(LiberoEnvFacade(backend, meta={}), transport) as rpc:
-        client = LiberoEnvClient(rpc, expected_meta={})
-        env = CapturingEnvClient(client, state)
+        client = LiberoEnvClient(
+            rpc, expected_meta={}, return_all_frames=default_all_frames
+        )
+        env = CapturingEnvClient(
+            client,
+            state,
+            capture_call=partial(libero_toolkit._capture_libero_call, client),
+        )
         with capture.bind() if capture else nullcontext():
             env.step(np.zeros(7, dtype=np.float32))
             with env.prediction("pick up the bowl"):
@@ -714,9 +772,11 @@ def test_libero_client_facade_capture_and_raw_trajectory_roundtrip(
         assert client.terminated and not client.truncated
         np.testing.assert_array_equal(result[2], [False, True, False, False, False])
         np.testing.assert_array_equal(client.last_obs["states"], np.full(8, 6))
-        assert isinstance(result[0], list) is all_frames
+        expected_all_frames = default_all_frames if all_frames is None else all_frames
+        assert isinstance(result[0], list) is expected_all_frames
+        assert (result[0][-1] if expected_all_frames else result[0]) is client.last_obs
     assert backend.reset_count == 1
-    assert backend.wrap_count == 7 + (2 if record else 0)
+    assert backend.wrap_count == 7
     np.testing.assert_array_equal(backend.executed[1:], commands)
     if not record:
         assert state.action_records() == state.prediction_records() == []
@@ -744,9 +804,9 @@ def test_libero_client_facade_capture_and_raw_trajectory_roundtrip(
     ):
         assert action["before_observation_id"] == f"O{index + 1}"
         assert action["after_observation_id"] == f"O{index + 2}"
-        np.testing.assert_array_equal(
-            read_array(root, action["action"]["data"]), command
-        )
+        saved_action = read_array(root, action["action"]["data"])
+        np.testing.assert_array_equal(saved_action, command)
+        assert saved_action.dtype == command.dtype
         for side, value in (("before", index), ("after", index + 1)):
             data = action[f"{side}_observation"]["payload"]["data"]
             np.testing.assert_array_equal(
@@ -757,7 +817,7 @@ def test_libero_client_facade_capture_and_raw_trajectory_roundtrip(
             )
 
 
-def test_libero_failed_chunk_discards_its_actions_and_refreshes_next_before_observation(
+def test_libero_failed_chunk_discards_unconfirmed_actions(
     transport, make_server_and_client, tmp_path
 ):
     from robots.libero.env_client import LiberoEnvClient
@@ -774,7 +834,12 @@ def test_libero_failed_chunk_discards_its_actions_and_refreshes_next_before_obse
     )
     backend = _LiberoBackend()
     with make_server_and_client(LiberoEnvFacade(backend, meta={}), transport) as rpc:
-        env = CapturingEnvClient(LiberoEnvClient(rpc, expected_meta={}), state)
+        client = LiberoEnvClient(rpc, expected_meta={})
+        env = CapturingEnvClient(
+            client,
+            state,
+            capture_call=partial(libero_toolkit._capture_libero_call, client),
+        )
         with ToolCallCapture(state, tool_id).bind():
             env.step(np.zeros(7))
             backend.fail_at = 3
@@ -783,9 +848,6 @@ def test_libero_failed_chunk_discards_its_actions_and_refreshes_next_before_obse
                     env.chunk_step(np.ones((4, 7)))
             assert len(state.action_records()) == 1
             assert state.prediction_records()[0].action_ids == []
-            backend.fail_at = None
-            env.step(np.zeros(7))
-    first, second = state.action_records()
-    assert second.before_observation_id != first.after_observation_id
-    before = state.get_observation(second.before_observation_id).payload
-    np.testing.assert_array_equal(before.data["states"], np.full(8, 3))
+            call = state.get_tool_call(tool_id)
+            assert call.missing["after_observation_id"].reason == "capture_failed"
+    assert len(backend.executed) == 3

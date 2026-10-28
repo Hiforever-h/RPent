@@ -60,6 +60,13 @@ class RoboCasaEnvClient(BaseEnvClient):
         )
         return self.last_obs
 
+    def step(self, flat_action):
+        result = self._client.call(
+            "env.step", args=(flat_action,), timeout_s=self._TIMEOUT_S["env.step"]
+        )
+        self.last_obs = result[0]
+        return result
+
     def check_success(self):
         return self._client.call(
             "env.check_success", timeout_s=self._TIMEOUT_S["default"]

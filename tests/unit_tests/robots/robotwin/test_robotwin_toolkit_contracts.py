@@ -21,6 +21,7 @@ import json
 import sys
 from contextlib import nullcontext
 from copy import deepcopy
+from functools import partial
 from pathlib import Path
 from threading import Lock
 from types import ModuleType, SimpleNamespace
@@ -32,8 +33,9 @@ import pytest
 from robots.robotwin import toolkit
 from robots.robotwin.env_client import RoboTwinEnvClient
 from robots.robotwin.primitives import RoboTwinPrimitives
+from robots.robotwin.toolkit import _capture_robotwin_call
 from rpent.dashboard.events import NullDashboardEventSink
-from rpent.data.reader import read_array
+from rpent.flywheel.reader import read_array
 from rpent.memory import MemoryManager
 from rpent.session import EnvState, Payload
 from rpent.session.capture import CapturingEnvClient, ToolCallCapture
@@ -371,19 +373,20 @@ def test_chunk_returns_only_executed_steps_with_distinct_observations(
         client = RoboTwinEnvClient(rpc, expected_meta=facade.get_env_meta())
         first = client.step(np.zeros(14), capture=capture)
         if capture:
-            assert first["steps"][0]["action"]["format"] == "robotwin.action.qpos"
+            first_capture = first[4]["capture"]
+            assert (
+                first_capture["steps"][0]["action"]["format"] == "robotwin.action.qpos"
+            )
             np.testing.assert_array_equal(
-                first["steps"][0]["action"]["data"], np.zeros(14)
+                first_capture["steps"][0]["action"]["data"], np.zeros(14)
             )
         reads = task.observation_reads
-        response = client.chunk_step(
+        obs, rewards, terminated, truncated, info = client.chunk_step(
             commands, action_type="ee", capture=capture, return_all_frames=all_frames
         )
-        result = response["result"] if capture else response
-        obs, rewards, terminated, truncated, info = result
         assert info["executed_actions"] == 2
         assert info["requested_actions"] == 5
-        assert "capture" not in info
+        assert ("capture" in info) is capture
         np.testing.assert_array_equal(rewards, [0, float(stop == "success")])
         np.testing.assert_array_equal(terminated, [False, stop == "success"])
         np.testing.assert_array_equal(truncated, [False, stop == "budget"])
@@ -407,9 +410,10 @@ def test_chunk_returns_only_executed_steps_with_distinct_observations(
     assert len(task.executed) == 3
     if not capture:
         return
-    assert len(response["steps"]) == 2
-    observations = [response["before_observation"]]
-    for index, step in enumerate(response["steps"]):
+    capture_data = info["capture"]
+    assert len(capture_data["steps"]) == 2
+    observations = [capture_data["before_observation"]]
+    for index, step in enumerate(capture_data["steps"]):
         assert step["action"]["format"] == "robotwin.action.ee"
         np.testing.assert_array_equal(step["action"]["data"], commands[index])
         assert (
@@ -422,6 +426,41 @@ def test_chunk_returns_only_executed_steps_with_distinct_observations(
         assert data["robot_state"]["left_eef_pose"][0] == count
         for camera in data["observation"].values():
             np.testing.assert_array_equal(camera["rgb"], np.full((2, 2, 3), count))
+
+
+@pytest.mark.parametrize(
+    ("method", "kwargs"),
+    [
+        ("step", {}),
+        ("chunk_step", {"return_all_frames": False}),
+        ("chunk_step", {"return_all_frames": True}),
+    ],
+)
+def test_captured_call_removes_capture_data_from_result_and_cache(
+    facade, make_server_and_client, transport, tmp_path, method, kwargs
+):
+    state = EnvState(tmp_path)
+    state.start_task(instruction="native instruction", config=Payload("json", {}))
+    planner = state.register_planner(backend="api")
+    tool_id = state.register_tool_call(
+        planner_id=planner, name="move", arguments=Payload("json", {})
+    )
+    with make_server_and_client(facade, transport) as rpc:
+        client = RoboTwinEnvClient(rpc, expected_meta=facade.get_env_meta())
+        env = CapturingEnvClient(
+            client, state, capture_call=partial(_capture_robotwin_call, client)
+        )
+        actions = np.zeros(14) if method == "step" else np.zeros((2, 14))
+        with ToolCallCapture(state, tool_id).bind():
+            result = getattr(env, method)(actions, **kwargs)
+        assert isinstance(result, tuple) and len(result) == 5
+        assert "capture" not in result[4]
+        assert "capture" not in client.last_info
+        assert (
+            result[4]["executed_actions"]
+            == len(state.action_records())
+            == (1 if method == "step" else 2)
+        )
 
 
 @pytest.mark.parametrize(
@@ -445,7 +484,9 @@ def test_lingbot_predictions_and_action_sources_reach_disk(
         planner = state.register_planner(backend="api")
     with make_server_and_client(facade, transport) as rpc:
         client = RoboTwinEnvClient(rpc, expected_meta=facade.get_env_meta())
-        env = CapturingEnvClient(client, state)
+        env = CapturingEnvClient(
+            client, state, capture_call=partial(_capture_robotwin_call, client)
+        )
         primitives = RoboTwinPrimitives(
             env=env,
             model=SimpleNamespace(infer=infer),
@@ -462,7 +503,10 @@ def test_lingbot_predictions_and_action_sources_reach_disk(
 
         @tool
         def computed():
-            env.step(np.zeros(14))
+            reads = task.observation_reads
+            result = env.step(np.zeros(14))
+            assert "capture" not in result[4]
+            assert task.observation_reads - reads == 1 + 2 * int(recording)
             return ToolResult(data={})
 
         toolkit.add_tool(computed)
@@ -483,6 +527,7 @@ def test_lingbot_predictions_and_action_sources_reach_disk(
             with ToolCallCapture(state, tool_id).bind() if recording else nullcontext():
                 result = toolkit.execute_tool(name, arguments)
             assert not result.is_error, result.data
+            assert "capture" not in client.last_info
         assert client.terminated
         assert len(task.executed) == 104
         assert len(inputs) == 3
@@ -568,7 +613,9 @@ def test_failed_chunk_discards_its_steps_but_keeps_prior_calls(
     )
     with make_server_and_client(facade, transport) as rpc:
         client = RoboTwinEnvClient(rpc, expected_meta=facade.get_env_meta())
-        env = CapturingEnvClient(client, state)
+        env = CapturingEnvClient(
+            client, state, capture_call=partial(_capture_robotwin_call, client)
+        )
         with ToolCallCapture(state, tool_id).bind():
             env.step(np.zeros(14))
             with env.prediction("native instruction"):

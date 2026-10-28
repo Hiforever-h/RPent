@@ -55,6 +55,7 @@ dependencies = [
 rpent = "rpent.cli.main:main"
 rpent-memory = "rpent.cli.memory:main"
 rpent-check-llm = "rpent.cli.check_llm:main"
+rpent-flywheel = "rpent.flywheel.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/RLinf/RPent"
@@ -145,7 +146,7 @@ robocasa = [
     "rlinf-rldx @ git+https://github.com/RLinf/RLDX-1.git@rpent",
     "robosuite @ git+https://github.com/RLinf/robosuite.git@rpent",
 ]
-data = [
+flywheel = [
     "lerobot>=0.3.3,<0.4",
     # OpenPI requires NumPy 1.x; PyArrow 26 requires NumPy 2 at import time.
     "pyarrow<26",
@@ -241,7 +242,7 @@ conflicts = [
     ],
     [
         { extra = "robotwin" },
-        { extra = "data" },
+        { extra = "flywheel" },
     ],
     [
         { extra = "robotwin" },
