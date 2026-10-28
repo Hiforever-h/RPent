@@ -40,7 +40,8 @@ def make_server_and_client():
             server = SocketRpcServer(("127.0.0.1", 0), facade._dispatch)
         else:
             server = HttpRpcServer(("127.0.0.1", 0), facade._dispatch)
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
         port = server.server_address[1]
         try:
             if transport == "socket":
@@ -55,5 +56,6 @@ def make_server_and_client():
         finally:
             server.shutdown()
             server.server_close()
+            thread.join(timeout=2)
 
     return _ctx
