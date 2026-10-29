@@ -30,8 +30,8 @@ from robots.libero.env_client import LiberoEnvClient
 from rpent.robots.components.molmo_client import MolmoClient
 from rpent.robots.components.pi05_vla_client import Pi05VLAClient
 from rpent.robots.components.sam3_client import Sam3Client
-from rpent.session import EnvState, MissingInfo, Payload, StepRecord
-from rpent.session.env_capture import CapturingEnvClient, current_tool_call
+from rpent.session import EnvState, StepRecord
+from rpent.session.env_capture import CapturingEnvClient
 from rpent.tools import Tool, ToolResult, tool
 from rpent.utils.logging import get_logger
 
@@ -144,33 +144,11 @@ class LiberoPrimitives:
         """Predict and execute one VLA action chunk with a sub-instruction."""
         self._check_cancelled()
         capturing = isinstance(self.env, CapturingEnvClient)
-        capture = current_tool_call.get() if capturing else None
-        options = {"mode": "eval"}
-        if capture is not None:
-            tool_call = capture.state.get_tool_call(capture.tool_call_id)
-            if tool_call.model_config is None:
-                capture.state.update_tool_call(
-                    capture.tool_call_id,
-                    effective_instruction=instruction,
-                    model_config=Payload(
-                        format="pi05.model_config",
-                        data={"predict_options": options},
-                        completeness="partial",
-                        missing={
-                            "/server_config": MissingInfo(
-                                "not_exposed",
-                                "VLA predict does not expose server configuration.",
-                            )
-                        },
-                    ),
-                    missing={"effective_instruction": None, "model_config": None},
-                )
-
         policy_obs = {**self._last_obs, "task_descriptions": instruction}
         policy_obs.setdefault("extra_view_images", None)
         prediction = self.env.prediction(instruction) if capturing else nullcontext()
         with prediction:
-            actions = self.model.predict(policy_obs, options=options)
+            actions = self.model.predict(policy_obs, options={"mode": "eval"})
             self._check_cancelled()
             all_frames = self._recording
             chunk_obs, *_ = self.env.chunk_step(

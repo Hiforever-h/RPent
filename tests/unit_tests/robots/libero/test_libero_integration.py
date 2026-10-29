@@ -340,13 +340,6 @@ def test_actions_follow_api_tool_calls(tmp_path, monkeypatch, mode, record_traje
         assert call.tool_call_id in {item.tool_call_id for item in planner.tool_calls}
 
     vla_call = tool_calls[1]
-    assert vla_call.effective_instruction == "pick up the bowl"
-    assert vla_call.model_config.data == {"predict_options": {"mode": "eval"}}
-    assert vla_call.model_config.completeness == "partial"
-    assert vla_call.model_config.missing["/server_config"].reason == "not_exposed"
-    assert "effective_instruction" not in vla_call.missing
-    assert "model_config" not in vla_call.missing
-
     assert len(saved_predictions) == 2
     for row, group in zip(saved_predictions, (actions[2:4], actions[4:6])):
         assert row["planner_id"] == vla_call.planner_id
