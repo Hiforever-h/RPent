@@ -33,6 +33,7 @@ import pytest
 from robots.robotwin import toolkit
 from robots.robotwin.env_client import RoboTwinEnvClient
 from robots.robotwin.primitives import RoboTwinPrimitives
+from robots.robotwin.robot_spec import env_runtime_contract
 from robots.robotwin.toolkit import _capture_robotwin_call
 from rpent.dashboard.events import NullDashboardEventSink
 from rpent.flywheel.reader import read_array
@@ -352,16 +353,16 @@ def facade(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("transport", "capture", "all_frames", "stop"),
+    ("transport", "all_frames", "stop"),
     [
-        ("socket", True, False, "success"),
-        ("http", True, True, "budget"),
-        ("socket", False, False, "budget"),
-        ("http", False, True, "success"),
+        ("socket", True, "success"),
+        ("http", True, "budget"),
+        ("socket", False, "budget"),
+        ("http", False, "success"),
     ],
 )
 def test_chunk_returns_only_executed_steps_with_distinct_observations(
-    facade, make_server_and_client, transport, capture, all_frames, stop
+    facade, make_server_and_client, transport, all_frames, stop
 ):
     task = facade._env.venv.envs[0].task
     if stop == "success":
@@ -371,22 +372,18 @@ def test_chunk_returns_only_executed_steps_with_distinct_observations(
     commands = np.arange(80, dtype=np.float64).reshape(5, 16)
     with make_server_and_client(facade, transport) as rpc:
         client = RoboTwinEnvClient(rpc, expected_meta=facade.get_env_meta())
-        first = client.step(np.zeros(14), capture=capture)
-        if capture:
-            first_capture = first[4]["capture"]
-            assert (
-                first_capture["steps"][0]["action"]["format"] == "robotwin.action.qpos"
-            )
-            np.testing.assert_array_equal(
-                first_capture["steps"][0]["action"]["data"], np.zeros(14)
-            )
+        first = client.step(np.zeros(14))
+        assert "before_observation" not in first[4]
+        assert task.executed[0][1] == "qpos"
+        np.testing.assert_array_equal(task.executed[0][0], np.zeros(14))
         reads = task.observation_reads
         obs, rewards, terminated, truncated, info = client.chunk_step(
-            commands, action_type="ee", capture=capture, return_all_frames=all_frames
+            commands, action_type="ee", return_all_frames=all_frames
         )
         assert info["executed_actions"] == 2
         assert info["requested_actions"] == 5
-        assert ("capture" in info) is capture
+        assert "capture" not in info
+        assert ("before_observation" in info) is all_frames
         np.testing.assert_array_equal(rewards, [0, float(stop == "success")])
         np.testing.assert_array_equal(terminated, [False, stop == "success"])
         np.testing.assert_array_equal(truncated, [False, stop == "budget"])
@@ -399,33 +396,42 @@ def test_chunk_returns_only_executed_steps_with_distinct_observations(
             client.last_info["robot_state"]["qpos_target14"],
             [3] * 6 + [0.5] + [3] * 6 + [0.5],
         )
-        assert task.observation_reads - reads == 1 + int(capture) + (
-            2 if capture or all_frames else 0
+        assert task.observation_reads - reads == 1 + (
+            info["executed_actions"] + 1 if all_frames else 0
         )
         if all_frames:
             assert len(obs["frames"]) == 2
-            for frame, count in zip(obs["frames"], (2, 3), strict=True):
-                np.testing.assert_array_equal(frame, np.full((2, 2, 3), count))
     assert task.reset_count == 1
     assert len(task.executed) == 3
-    if not capture:
+    for index, (action, action_type) in enumerate(task.executed[1:]):
+        assert action_type == "ee"
+        np.testing.assert_array_equal(action, commands[index])
+        assert info["per_step"][index]["episode_status"]["take_action_cnt"] == index + 2
+    if not all_frames:
         return
-    capture_data = info["capture"]
-    assert len(capture_data["steps"]) == 2
-    observations = [capture_data["before_observation"]]
-    for index, step in enumerate(capture_data["steps"]):
-        assert step["action"]["format"] == "robotwin.action.ee"
-        np.testing.assert_array_equal(step["action"]["data"], commands[index])
-        assert (
-            step["result"]["data"]["info"]["episode_status"]["take_action_cnt"]
-            == index + 2
-        )
-        observations.append(step["after_observation"])
+    observations = [info["before_observation"], *obs["frames"]]
     for count, observation in enumerate(observations, 1):
-        data = observation["data"]
-        assert data["robot_state"]["left_eef_pose"][0] == count
-        for camera in data["observation"].values():
+        assert observation["task_language"] == "native instruction"
+        assert observation["robot_state"]["left_eef_pose"][0] == count
+        for camera in observation["observation"].values():
             np.testing.assert_array_equal(camera["rgb"], np.full((2, 2, 3), count))
+            np.testing.assert_array_equal(camera["intrinsic_cv"], np.eye(3))
+
+
+def test_old_frame_format_is_rejected_before_reset(
+    facade, make_server_and_client, transport
+):
+    expected_meta = env_runtime_contract(
+        task_name="beat_block_hammer", task_config="demo_clean", seed=7
+    )
+    facade._metadata = deepcopy(expected_meta)
+    facade._metadata["execution"].pop("chunk_step_frame_format")
+    with make_server_and_client(facade, transport) as rpc:
+        with pytest.raises(AssertionError, match="chunk_step_frame_format"):
+            RoboTwinEnvClient(rpc, expected_meta=expected_meta)
+    task = facade._env.venv.envs[0].task
+    assert task.reset_count == 0
+    assert task.executed == []
 
 
 @pytest.mark.parametrize(
@@ -436,7 +442,7 @@ def test_chunk_returns_only_executed_steps_with_distinct_observations(
         ("chunk_step", {"return_all_frames": True}),
     ],
 )
-def test_captured_call_removes_capture_data_from_result_and_cache(
+def test_captured_call_preserves_return_shape_and_cache(
     facade, make_server_and_client, transport, tmp_path, method, kwargs
 ):
     state = EnvState(tmp_path)
@@ -450,17 +456,39 @@ def test_captured_call_removes_capture_data_from_result_and_cache(
         env = CapturingEnvClient(
             client, state, capture_call=partial(_capture_robotwin_call, client)
         )
-        actions = np.zeros(14) if method == "step" else np.zeros((2, 14))
+        action_count = 1 if method == "step" else 2
+        actions = np.arange(action_count * 14, dtype=np.float32).reshape(-1, 14)
         with ToolCallCapture(state, tool_id).bind():
-            result = getattr(env, method)(actions, **kwargs)
+            if method == "step":
+                with pytest.raises(ValueError, match="must be a single action"):
+                    env.step(np.zeros((2, 14)))
+                assert facade._env.venv.envs[0].task.executed == []
+            argument = "action" if method == "step" else "actions"
+            result = getattr(env, method)(**{argument: actions}, **kwargs)
         assert isinstance(result, tuple) and len(result) == 5
-        assert "capture" not in result[4]
-        assert "capture" not in client.last_info
+        assert "before_observation" not in result[4]
+        assert "before_observation" not in client.last_info
         assert (
             result[4]["executed_actions"]
             == len(state.action_records())
-            == (1 if method == "step" else 2)
+            == len(facade._env.venv.envs[0].task.executed)
+            == action_count
         )
+        if method == "step":
+            assert isinstance(result[1], float)
+            assert isinstance(result[2], bool)
+            assert isinstance(result[3], bool)
+        else:
+            for signal in result[1:4]:
+                assert signal.shape == (action_count,)
+        if kwargs.get("return_all_frames"):
+            assert len(result[0]["frames"]) == action_count
+            assert result[0]["final"] is client.last_obs
+        else:
+            assert result[0] is client.last_obs
+        for recorded, action in zip(state.action_records(), actions, strict=True):
+            assert recorded.action.data.dtype == np.float64
+            np.testing.assert_array_equal(recorded.action.data, action)
 
 
 @pytest.mark.parametrize(
@@ -533,6 +561,11 @@ def test_lingbot_predictions_and_action_sources_reach_disk(
         assert len(inputs) == 3
         assert primitives.policy_actions == 102
         assert primitives.recorded_frame_count() == 103
+        for frame, count in zip(
+            primitives.frame_slice(0), [*range(1, 52), *range(53, 105)], strict=True
+        ):
+            assert frame.dtype == np.uint8
+            np.testing.assert_array_equal(frame, np.full((2, 2, 3), count))
     assert task.reset_count == 1
     if not recording:
         assert state.action_records() == state.prediction_records() == []

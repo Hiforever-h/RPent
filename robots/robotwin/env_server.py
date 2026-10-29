@@ -180,7 +180,7 @@ class RoboTwinEnvFacade(BaseEnvFacade):
         return self._strip_single_env_observation(observation), info
 
     def step(
-        self, action, *, action_type: RoboTwinActionType = "qpos", capture: bool = False
+        self, action, *, action_type: RoboTwinActionType = "qpos"
     ) -> tuple[Any, Any, Any, Any, dict[str, Any]]:
         expected_dim = 14 if action_type == "qpos" else 16
         array = np.asarray(action, dtype=np.float64)
@@ -191,7 +191,7 @@ class RoboTwinEnvFacade(BaseEnvFacade):
         if not np.isfinite(array).all():
             raise ValueError("RoboTwin common action must contain only finite values")
         observation, reward, terminated, truncated, info = self._env.step(
-            array, action_type=action_type, capture=capture
+            array, action_type=action_type
         )
         return (
             self._strip_single_env_observation(observation),
@@ -207,7 +207,6 @@ class RoboTwinEnvFacade(BaseEnvFacade):
         *,
         action_type: RoboTwinActionType = "qpos",
         return_all_frames: bool = False,
-        capture: bool = False,
     ) -> tuple[Any, Any, Any, Any, dict[str, Any]]:
         expected_dim = 14 if action_type == "qpos" else 16
         array = np.asarray(actions, dtype=np.float64)
@@ -219,10 +218,7 @@ class RoboTwinEnvFacade(BaseEnvFacade):
             raise ValueError("RoboTwin common actions must contain only finite values")
         observation_list, rewards, terminated, truncated, info_list = (
             self._env.chunk_step(
-                array,
-                action_type=action_type,
-                return_all_frames=return_all_frames,
-                capture=capture,
+                array, action_type=action_type, return_all_frames=return_all_frames
             )
         )
         if len(observation_list) != 1 or len(info_list) != 1:

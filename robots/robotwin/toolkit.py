@@ -369,6 +369,70 @@ def _capture_robotwin_call(
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Execute a RoboTwin call and extract its capture data."""
-    result = getattr(env, method)(*args, capture=True, **kwargs)
-    capture_data = result[4].pop("capture")
-    return {"result": result, **capture_data}
+    if args:
+        (actions,) = args
+    else:
+        actions = kwargs.pop("action" if method == "step" else "actions")
+    array = np.atleast_2d(np.asarray(actions, dtype=np.float64))
+    if method == "step" and len(array) != 1:
+        raise ValueError("RoboTwin common action must be a single action")
+    return_all_frames = (
+        kwargs.pop("return_all_frames", False) if method == "chunk_step" else False
+    )
+    obs, rewards, terminated, truncated, info = env.chunk_step(
+        array, return_all_frames=True, **kwargs
+    )
+    before = info.pop("before_observation")
+    if method == "step":
+        result = (
+            obs["final"],
+            float(rewards[0]),
+            bool(terminated[0]),
+            bool(truncated[0]),
+            info,
+        )
+    else:
+        result = (
+            obs if return_all_frames else obs["final"],
+            rewards,
+            terminated,
+            truncated,
+            info,
+        )
+
+    def observation_payload(observation):
+        return {
+            "format": "robotwin.observation",
+            "data": observation,
+            "completeness": "complete",
+            "inline_array_paths": tuple(
+                f"/robot_state/{key}" for key in observation["robot_state"]
+            ),
+        }
+
+    return {
+        "result": result,
+        "before_observation": observation_payload(before),
+        "steps": [
+            {
+                "action": {
+                    "format": f"robotwin.action.{info['action_type']}",
+                    "data": array[index].copy(),
+                    "completeness": "complete",
+                    "inline_array_paths": ("",),
+                },
+                "after_observation": observation_payload(obs["frames"][index]),
+                "result": {
+                    "format": "robotwin.step_result",
+                    "data": {
+                        "reward": float(rewards[index]),
+                        "terminated": bool(terminated[index]),
+                        "truncated": bool(truncated[index]),
+                        "info": info["per_step"][index],
+                    },
+                    "completeness": "complete",
+                },
+            }
+            for index in range(info["executed_actions"])
+        ],
+    }

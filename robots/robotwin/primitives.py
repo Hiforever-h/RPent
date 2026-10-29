@@ -272,7 +272,7 @@ class RoboTwinPrimitives:
                 )
             if self._recording and isinstance(payload, dict) and "frames" in payload:
                 for frame in payload["frames"]:
-                    self.record_frame(frame)
+                    self.record_frame(frame["observation"]["head_camera"]["rgb"])
             count = int(info.get("executed_actions", 0))
             executed += count
             self.policy_actions += count

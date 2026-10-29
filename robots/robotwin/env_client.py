@@ -111,7 +111,6 @@ class RoboTwinEnvClient(BaseEnvClient):
         action,
         *,
         action_type: RoboTwinActionType = "qpos",
-        capture: bool = False,
     ) -> tuple[Any, Any, Any, Any, dict[str, Any]]:
         """Execute one RoboTwin action and update the cached episode state."""
         flat = self._validate_action_request(action_type, action)
@@ -119,13 +118,10 @@ class RoboTwinEnvClient(BaseEnvClient):
             raise ValueError("RoboTwin common action must be a single action")
         flat = flat[0]
         self._require_common_active()
-        kwargs = {"action_type": action_type}
-        if capture:
-            kwargs["capture"] = True
         result = self._client.call(
             "env.step",
             args=(flat,),
-            kwargs=kwargs,
+            kwargs={"action_type": action_type},
             timeout_s=ROBOTWIN_STATE_CHANGE_TIMEOUT_S,
         )
         result = self._require_result_tuple(result, 5, "env.step")
@@ -143,7 +139,6 @@ class RoboTwinEnvClient(BaseEnvClient):
         *,
         action_type: RoboTwinActionType = "qpos",
         return_all_frames: bool = False,
-        capture: bool = False,
     ) -> tuple[Any, Any, Any, Any, dict[str, Any]]:
         """Execute a RoboTwin action chunk and cache the final episode state."""
         array = self._validate_action_request(action_type, actions)
@@ -154,13 +149,13 @@ class RoboTwinEnvClient(BaseEnvClient):
         ):
             raise ValueError("env.chunk_step does not support return_all_frames=True")
         self._require_common_active()
-        kwargs = {"action_type": action_type, "return_all_frames": return_all_frames}
-        if capture:
-            kwargs["capture"] = True
         result = self._client.call(
             "env.chunk_step",
             args=(array,),
-            kwargs=kwargs,
+            kwargs={
+                "action_type": action_type,
+                "return_all_frames": return_all_frames,
+            },
             timeout_s=ROBOTWIN_STATE_CHANGE_TIMEOUT_S,
         )
         result = self._require_result_tuple(result, 5, "env.chunk_step")

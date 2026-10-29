@@ -152,6 +152,7 @@ def env_runtime_contract(
             "chunk_step": True,
             "action_layouts": ["qpos14", MODEL_SPEC.action_layout],
             "chunk_step_all_frames": True,
+            "chunk_step_frame_format": "robotwin.observation",
             "step_limit": int(max_episode_steps),
         },
         "extensions": {
