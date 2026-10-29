@@ -419,17 +419,10 @@ class _CaptureEnv(BaseEnvFacade):
             ],
         }
 
-    def chunk_step(self, actions, *, return_all_frames=False, capture=False):
+    def chunk_step(self, actions, *, return_all_frames=False):
         results = []
-        steps = []
-        before = None
         for action in actions:
-            response = self.step(action, capture=capture)
-            result = response["result"] if capture else response
-            if capture:
-                if before is None:
-                    before = response["before_observation"]
-                steps.extend(response["steps"])
+            result = self.step(action)
             results.append(result)
             if result[2]:
                 break
@@ -442,56 +435,70 @@ class _CaptureEnv(BaseEnvFacade):
         )
         if self.tuple_size == 5:
             result = (*result[:3], np.zeros(len(results), dtype=bool), result[-1])
-        if not capture:
-            return result
-        return {"result": result, "before_observation": before, "steps": steps}
+        return result
 
 
 @pytest.mark.parametrize("tuple_size", [4, 5])
-@pytest.mark.parametrize(
-    ("method", "all_frames"),
-    [("step", False), ("chunk_step", False), ("chunk_step", True)],
-)
-def test_capture_preserves_results_and_executed_steps(
-    transport, make_server_and_client, tuple_size, method, all_frames
+@pytest.mark.parametrize("value", [0.5, 2.0])
+def test_step_capture_preserves_result_and_executed_action(
+    transport, make_server_and_client, tuple_size, value
 ):
     facade = _CaptureEnv(tuple_size)
-    actions = np.array([[0.5], [2.0], [0.75]], dtype=np.float64)
-    action = actions[0] if method == "step" else actions
-    kwargs = {} if method == "step" else {"return_all_frames": all_frames}
+    action = np.array([value], dtype=np.float64)
     with make_server_and_client(facade, transport) as rpc:
         env = BaseEnvClient(rpc, expected_meta={})
-        original = getattr(env, method)(action, **kwargs)
+        original = env.step(action)
         original_obs = env.last_obs
         env.reset()
-        captured = getattr(env, method)(action, capture=True, **kwargs)
+        captured = env.step(action, capture=True)
 
     np.testing.assert_equal(captured["result"], original)
     np.testing.assert_equal(env.last_obs, original_obs)
     before = captured["before_observation"]
     assert before["format"] == "test.observation"
     np.testing.assert_array_equal(before["data"]["state"], [0.0])
-    steps = captured["steps"]
-    assert len(steps) == (1 if method == "step" else 2)
-    for index, step in enumerate(steps):
-        assert step["action"]["format"] == "test.action"
-        assert step["action"]["completeness"] == "complete"
-        assert step["action"]["data"].dtype == np.float32
-        np.testing.assert_array_equal(
-            step["action"]["data"], [0.5 if index == 0 else 1]
+    (step,) = captured["steps"]
+    assert step["action"]["format"] == "test.action"
+    assert step["action"]["completeness"] == "complete"
+    assert step["action"]["data"].dtype == np.float32
+    np.testing.assert_array_equal(step["action"]["data"], [min(value, 1)])
+    after = step["after_observation"]
+    assert after["format"] == "test.observation"
+    assert after["data"]["state"].dtype == np.float32
+    np.testing.assert_array_equal(after["data"]["state"], [min(value, 1)])
+    assert after["data"]["image"].dtype == np.uint8
+    np.testing.assert_array_equal(
+        after["data"]["image"], np.full((2, 3, 3), 1, dtype=np.uint8)
+    )
+    assert step["result"]["format"] == "test.result"
+    assert step["result"]["data"]["info"] == {"count": 1}
+
+
+@pytest.mark.parametrize("tuple_size", [4, 5])
+@pytest.mark.parametrize("all_frames", [False, True])
+def test_chunk_returns_executed_frames_and_caches_final_observation(
+    transport, make_server_and_client, tuple_size, all_frames
+):
+    facade = _CaptureEnv(tuple_size)
+    with make_server_and_client(facade, transport) as rpc:
+        env = BaseEnvClient(rpc, expected_meta={})
+        result = env.chunk_step(
+            np.array([[0.5], [2.0], [0.75]]), return_all_frames=all_frames
         )
-        after = step["after_observation"]
-        assert after["format"] == "test.observation"
-        assert after["data"]["state"].dtype == np.float32
+
+    assert facade.count == 2
+    assert len(result) == tuple_size
+    assert result[-1] == {"executed_actions": 2}
+    np.testing.assert_array_equal(result[1], [0.5, 1.5])
+    np.testing.assert_array_equal(result[2], [False, True])
+    observations = result[0] if all_frames else [result[0]]
+    assert len(observations) == (2 if all_frames else 1)
+    for count, obs in zip((1, 2) if all_frames else (2,), observations):
+        np.testing.assert_array_equal(obs["state"], [0.5 if count == 1 else 1.5])
         np.testing.assert_array_equal(
-            after["data"]["state"], [0.5 if index == 0 else 1.5]
+            obs["image"], np.full((2, 3, 3), count, dtype=np.uint8)
         )
-        assert after["data"]["image"].dtype == np.uint8
-        np.testing.assert_array_equal(
-            after["data"]["image"], np.full((2, 3, 3), index + 1, dtype=np.uint8)
-        )
-        assert step["result"]["format"] == "test.result"
-        assert step["result"]["data"]["info"] == {"count": index + 1}
+    assert env.last_obs is observations[-1]
 
 
 def test_failed_chunk_raises_without_updating_cached_observation(
@@ -502,7 +509,7 @@ def test_failed_chunk_raises_without_updating_cached_observation(
         env = BaseEnvClient(rpc, expected_meta={})
         before = env.last_obs
         with pytest.raises(RpcError, match="environment step failed"):
-            env.chunk_step(np.array([[0.5], [-1.0]]), capture=True)
+            env.chunk_step(np.array([[0.5], [-1.0]]))
         assert facade.count == 1
         assert env.last_obs is before
 

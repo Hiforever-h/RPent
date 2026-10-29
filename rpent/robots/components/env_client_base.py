@@ -93,14 +93,9 @@ class BaseEnvClient:
         self.last_obs = (result["result"] if capture else result)[0]
         return result
 
-    def chunk_step(
-        self,
-        flat_actions,
-        *,
-        return_all_frames: bool = False,
-        capture: bool = False,
-    ):
-        """Execute N actions in one batch. Returns the backend's gym tuple.
+    def chunk_step(self, flat_actions, *, return_all_frames: bool = False):
+        """Execute N actions in one batch. Returns the 5-tuple
+        ``(obs, rew, term, trunc, info)``.
 
         - ``obs_or_list``: ``list[Obs]`` when ``return_all_frames=True`` (one
           per step, carrying the per-step render); the final obs dict when
@@ -110,18 +105,15 @@ class BaseEnvClient:
 
         ``return_all_frames`` is the standard perf-vs-video switch. ``True``
         renders agentview per step (high-density video); ``False`` renders only
-        the final obs (fast). ``capture`` has the same meaning as in :meth:`step`.
+        the final obs (fast).
         """
-        kwargs = {"return_all_frames": return_all_frames}
-        if capture:
-            kwargs["capture"] = True
         result = self._client.call(
             "env.chunk_step",
             args=(flat_actions,),
-            kwargs=kwargs,
+            kwargs={"return_all_frames": return_all_frames},
             timeout_s=self._TIMEOUT_S["env.chunk_step"],
         )
-        obs_field = (result["result"] if capture else result)[0]
+        obs_field = result[0]
         if isinstance(obs_field, list):
             self.last_obs = obs_field[-1]
         else:
