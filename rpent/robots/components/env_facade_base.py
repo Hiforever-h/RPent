@@ -16,8 +16,6 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from rpent.utils.rpc import RpcFacade
 
 
@@ -96,27 +94,12 @@ class BaseEnvFacade(RpcFacade):
         """Reset the env and return ``(initial_obs, info)``."""
         raise NotImplementedError
 
-    def step(self, *args: Any, capture: bool = False, **kwargs: Any) -> Any:
-        """Execute one action and optionally return execution details.
-
-        Without capture, return the existing gym tuple. Backends supporting
-        capture return a dictionary with the original tuple under ``result``
-        and backend-specific execution details. A toolkit capture callback
-        converts raw details into recording payloads; backends that already
-        return recording payloads can be used without a callback.
-
-        Failed calls raise normally and return no partial details.
-        """
+    def step(self, *args, **kwargs):
+        """Execute one env action. Returns the gym tuple result."""
         raise NotImplementedError
 
-    def chunk_step(
-        self,
-        *args: Any,
-        return_all_frames: bool = False,
-        capture: bool = False,
-        **kwargs: Any,
-    ) -> Any:
-        """Execute an action batch, using :meth:`step`'s capture response format."""
+    def chunk_step(self, *args, **kwargs):
+        """Execute N actions in one batch. Returns the gym tuple result."""
         raise NotImplementedError
 
     def get_camera_meta(self, *args, **kwargs):
