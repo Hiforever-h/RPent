@@ -3,77 +3,75 @@
 Data Flywheel
 =============
 
-The optional Flywheel records executed LIBERO evaluation trajectories without
-changing the planner or action primitives. It stores immutable raw episodes;
-conversion to a training format is a separate step.
+Use ``--record-trajectory`` with the ``api`` planner to save model requests,
+responses, and tool calls. Supported environments also record executed actions
+and their observations for later export to LeRobot training data.
 
 Installation
 ------------
 
-Follow :doc:`../get_started/quickstart` for environment setup and simulator assets. From
-the RPent repository root, install LIBERO-PRO with Flywheel export support:
+The example below uses LIBERO-PRO. Follow :doc:`../get_started/quickstart` for
+environment setup and simulator assets, and :doc:`configure_planner` for API
+credentials. From the RPent repository root, install LIBERO-PRO with the
+optional export dependencies:
 
 .. code-block:: bash
 
    uv pip install -e ".[libero-pro,flywheel]"
 
-Collect an Episode
-------------------
+Record a Trajectory
+-------------------
 
-Enable collection on a normal LIBERO evaluation run and choose a data root:
+Recording is off by default and requires ``--planner api``. Action recording
+supports LIBERO, RoboCasa365, and RoboTwin in evaluation mode, and RoboDojo.
+Exploration runs in the first three environments record planner and tool calls
+only. Enable recording and choose a run directory:
 
 .. code-block:: bash
 
    rpent --robot libero \
      --suite libero_goal --task 0 --seed 0 \
-     --planner codex \
-     --collect-flywheel-data \
-     --flywheel-root /path/to/datacollection
+     --planner api --model anthropic:claude-opus-4-8 \
+     --record-trajectory \
+     --output-dir /path/to/run
 
-The run writes one episode below
-``/path/to/datacollection/raw/libero/<suite>/task_<id>/seed_<seed>/``. Each episode
-contains the policy observations, executed actions, rewards, terminal flags,
-primitive IDs, and VLA proposals. Collection is opt-in and is supported only
-for evaluation mode.
+After the run, records are saved under ``/path/to/run/trajectories/<task_id>/``:
+``task.json``, ``planners.jsonl``, ``actions.jsonl``, ``predictions.jsonl``, and
+an ``artifacts/`` directory for attachments. VLA records link each instruction
+to the actions actually executed; predicted actions that were not executed are
+not saved.
 
-Validate and Export Successful Episodes
----------------------------------------
+Export Training Data
+--------------------
 
-Validate one raw episode before using it:
-
-.. code-block:: bash
-
-   rpent-flywheel validate /path/to/raw/episode
-
-Export every finalized successful episode for one suite and task to a LeRobot
-dataset:
+Export recorded trajectories from one robot to a new output directory:
 
 .. code-block:: bash
 
-   rpent-flywheel export-lerobot \
-     --data-root /path/to/datacollection \
-     --suite libero_goal \
-     --task 0 \
-     --dataset-id goal-task-00 \
-     --output-root /path/to/lerobot
+   rpent-flywheel \
+     --input-root /path/to/run \
+     --output-dir /path/to/lerobot/goal-task-00
 
-``--data-root`` is the raw data root, while ``--output-root`` is the parent
-directory of the exported dataset. This example writes the dataset to
-``/path/to/lerobot/goal-task-00``.
+``--input-root`` accepts a trajectory directory containing ``task.json`` or a
+parent directory containing multiple runs. Export each robot separately;
+``--output-dir`` must not already exist.
 
-For each successful episode, the exporter includes all executed actions from the
-start through the first action that achieves task success, including scripted
-and VLA actions. Actions after the first success are excluded.
+Only tasks confirmed successful by the environment are eligible; planner
+completion alone is insufficient. The exporter selects only continuous segments
+of executed VLA actions with the required observations; scripted actions are
+excluded.
 
-The exporter never rewrites the raw episodes. Failed episodes remain available
-for auditing but are not included in this supervised-training export.
+The dataset is written to ``/path/to/lerobot/goal-task-00/train/`` without an
+automatic validation split. ``report.json`` in the output directory lists
+export counts and exclusions. If no actions qualify, only the report is
+written. Original recordings are left unchanged.
 
 Train with RLinf
 ----------------
 
-After exporting successful trajectories to LeRobot, you can perform Pi0.5
-supervised fine-tuning in a separate RLinf environment. RPent handles collection
-and export; RLinf handles model training, logging, and checkpoint saving.
+For the LIBERO example, use the exported LeRobot dataset for Pi0.5 supervised
+fine-tuning in a separate RLinf environment. RPent handles collection and
+export; RLinf handles model training, logging, and checkpoint saving.
 
 For environment setup and training configuration, see the
 `RLinf OpenPI SFT guide <https://rlinf.readthedocs.io/en/latest/rst_source/examples/embodied/sft_openpi.html>`_.
@@ -94,7 +92,7 @@ Pi0.5 LIBERO SFT configuration at
    .venv/bin/python examples/sft/train_vla_sft.py \
      --config-path /path/to/sft-config \
      --config-name libero_pi05_sft \
-     data.train_data_paths=/path/to/lerobot/goal-task-00 \
+     data.train_data_paths=/path/to/lerobot/goal-task-00/train \
      actor.model.model_path=/path/to/pi05-checkpoint \
      runner.logger.log_path=/path/to/new-training-output
 
