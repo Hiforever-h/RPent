@@ -27,6 +27,9 @@
      --record-trajectory \
      --output-dir /path/to/run
 
+- ``--record-trajectory``：开启轨迹采集，记录模型请求、回复和工具调用；支持动作采集的环境还会记录实际执行的动作及观测。默认关闭，仅在 ``--planner api`` 下生效。
+- ``--output-dir /path/to/run``：指定本次运行的输出根目录，请将 ``/path/to/run`` 替换为实际保存路径。轨迹记录保存在该目录的 ``trajectories/<task_id>/`` 子目录中。
+
 运行结束后，记录保存在 ``/path/to/run/trajectories/<task_id>/`` 下，包括 ``task.json``、``planners.jsonl``、``actions.jsonl``、``predictions.jsonl`` 和存放附件的 ``artifacts/`` 目录。VLA 记录将每次指令与实际执行的动作关联，不保存未执行的预测动作。
 
 导出训练数据
@@ -42,7 +45,11 @@
 
 ``--input-root`` 可以指向包含 ``task.json`` 的单条轨迹目录，也可以指向包含多次运行的上级目录。不同机器人应分别导出；``--output-dir`` 必须尚不存在。
 
-只有环境确认成功的任务才参与导出，规划器结束不代表任务成功。导出程序只选取具有所需观测的连续 VLA 动作片段，脚本动作不参与导出。
+只有环境确认成功的任务才参与导出，规划器结束不代表任务成功。导出程序按以下规则筛选和组织训练数据：
+
+- 成功判定：任务结果中的 ``environment_success`` 必须明确为 ``true``；失败、结果缺失或无法确认成功的任务均不导出。
+- 动作来源：只保留实际执行、且能唯一关联到有效 VLA 预测记录的动作。预测记录必须包含非空指令，并与动作属于同一次工具调用。脚本动作、其他非 VLA 动作，以及未执行的预测动作均不参与导出。
+- 数据组织：每个连续片段保存为独立的 LeRobot episode，每个实际执行的动作对应一帧，包含执行前观测、动作和对应的 VLA 指令。
 
 数据集保存在 ``/path/to/lerobot/goal-task-00/train/``，不会自动划分验证集。输出目录中的 ``report.json`` 记录导出数量和排除原因；没有符合条件的动作时，只生成报告。原始记录不会被修改。
 
@@ -70,3 +77,29 @@
      runner.logger.log_path=/path/to/new-training-output
 
 根据可用 GPU 设置配置中的资源分配和 batch size，并使用与所选模型和数据集相匹配的 checkpoint 及归一化设置。
+
+SFT 实验结果
+------------
+
+2026-10-23，使用 RPent 采集的成功轨迹，对 ``RLinf-Pi05-LIBERO-130-fullshot-SFT`` 进行微调，并在 RPent 中替换 VLA 模型进行对比评测。
+
+训练数据来自 LIBERO-PRO 的三个 goal 系列 suite，共 199 条有效成功轨迹。训练采用语言分支 LoRA 与动作分支全量微调，共训练 500 步，按验证损失选择已保存的 step 300 检查点用于评测。
+
+评测使用 ``libero_goal_swap`` 的 task 0–9、seed 25–34，每组共 100 场。两组使用相同的 DeepSeek-V4.1-Flash-1017 规划器（reasoning effort 为 ``none``）和官方 memory，仅替换 VLA 模型。
+
+完整 RPent 系统的任务成功率如下：
+
+.. list-table::
+   :header-rows: 1
+
+   * - 模型
+     - 成功数 / 场次
+     - 成功率
+   * - 原模型
+     - 70/100
+     - 70%
+   * - SFT 模型（step 300）
+     - 73/100
+     - 73%
+
+本次评测中，SFT 后的模型多成功 3 场，成功率提高 3 个百分点。

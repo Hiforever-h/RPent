@@ -35,6 +35,14 @@ only. Enable recording and choose a run directory:
      --record-trajectory \
      --output-dir /path/to/run
 
+- ``--record-trajectory``: Enable trajectory recording for model requests,
+  responses, and tool calls. Supported environments also record executed
+  actions and their observations. Recording is off by default and requires
+  ``--planner api``.
+- ``--output-dir /path/to/run``: Set the output root directory for this run.
+  Replace ``/path/to/run`` with your desired save path. Trajectory records are
+  saved in its ``trajectories/<task_id>/`` subdirectory.
+
 After the run, records are saved under ``/path/to/run/trajectories/<task_id>/``:
 ``task.json``, ``planners.jsonl``, ``actions.jsonl``, ``predictions.jsonl``, and
 an ``artifacts/`` directory for attachments. VLA records link each instruction
@@ -57,9 +65,19 @@ parent directory containing multiple runs. Export each robot separately;
 ``--output-dir`` must not already exist.
 
 Only tasks confirmed successful by the environment are eligible; planner
-completion alone is insufficient. The exporter selects only continuous segments
-of executed VLA actions with the required observations; scripted actions are
-excluded.
+completion alone is insufficient. The exporter selects and organizes training
+data using the following rules:
+
+- Success criterion: ``environment_success`` in the task result must explicitly
+  be ``true``. Failed tasks, missing results, and tasks whose success cannot be
+  confirmed are excluded.
+- Action source: Only executed actions uniquely linked to a valid VLA prediction
+  record are retained. The prediction must contain a non-empty instruction and
+  belong to the same tool call as the action. Scripted actions, other non-VLA
+  actions, and unexecuted predicted actions are excluded.
+- Data organization: Each continuous segment is saved as a separate LeRobot
+  episode. Each executed action corresponds to one frame containing the
+  observation before execution, the action, and the corresponding VLA instruction.
 
 The dataset is written to ``/path/to/lerobot/goal-task-00/train/`` without an
 automatic validation split. ``report.json`` in the output directory lists
@@ -99,3 +117,37 @@ Pi0.5 LIBERO SFT configuration at
 Match the configuration's resource placement and batch size to your available
 GPUs, and use the checkpoint and normalization settings for the selected model
 and dataset.
+
+SFT Experiment Results
+----------------------
+
+On 2026-10-23, successful trajectories collected with RPent were used to fine-tune
+``RLinf-Pi05-LIBERO-130-fullshot-SFT``. The resulting VLA model was evaluated
+against the original model within RPent.
+
+Training used 199 usable successful trajectories from LIBERO-PRO's three goal
+suites. Language-branch LoRA and full fine-tuning of the action branch ran for
+500 steps.
+The saved checkpoint at step 300 was selected by validation loss for evaluation.
+
+Evaluation covered tasks 0–9 and seeds 25–34 in ``libero_goal_swap``, for 100 runs
+per model. Both groups used the same DeepSeek-V4.1-Flash-1017 planner (reasoning
+effort: ``none``) and official memory, with only the VLA model replaced.
+
+Task success rates for the full RPent system were:
+
+.. list-table::
+   :header-rows: 1
+
+   * - Model
+     - Successes / runs
+     - Success rate
+   * - Original model
+     - 70/100
+     - 70%
+   * - SFT model (step 300)
+     - 73/100
+     - 73%
+
+In this evaluation, the SFT model succeeded in three more runs, increasing the
+success rate by three percentage points.
