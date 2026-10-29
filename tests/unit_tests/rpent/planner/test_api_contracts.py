@@ -1242,7 +1242,7 @@ def test_reasoning_effort_reaches_openai_chat_request_body(tmp_path, effort):
 def test_api_executes_readonly_calls_concurrently(tmp_path):
     from weakref import ref
 
-    from rpent.session.capture import current_tool_call
+    from rpent.session.env_capture import current_tool_call
 
     events = Events()
     toolkit = capturing_toolkit(tmp_path, events)
@@ -1473,7 +1473,7 @@ def test_capture_non_streaming_model_request(tmp_path):
     )
     from pydantic_ai.models import ModelRequestParameters
 
-    from rpent.session.capture import CapturingModel
+    from rpent.session.planner_capture import CapturingModel
 
     toolkit = capturing_toolkit(tmp_path)
     image = BinaryContent(

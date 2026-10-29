@@ -30,7 +30,7 @@ from robots.robocasa import tools as robocasa_tools
 from robots.robocasa.env_server import DEFAULT_CAMS
 from rpent.dashboard.events import DashboardEventSink
 from rpent.session import EnvState
-from rpent.session.capture import CapturingEnvClient
+from rpent.session.env_capture import CapturingEnvClient
 from rpent.tools import ToolResult, iter_tools
 from rpent.tools.direct_action import direct_action_tool
 from rpent.tools.toolkit import Toolkit

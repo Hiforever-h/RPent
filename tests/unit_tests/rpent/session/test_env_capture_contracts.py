@@ -23,7 +23,7 @@ import pytest
 from rpent.dashboard.events import NullDashboardEventSink
 from rpent.memory import MemoryManager
 from rpent.session import ArtifactRef, EnvState, MissingInfo, Payload
-from rpent.session.capture import CapturingEnvClient, ToolCallCapture
+from rpent.session.env_capture import CapturingEnvClient, ToolCallCapture
 from rpent.tools import Toolkit, ToolResult, tool
 from rpent.tools.direct_action import direct_action_tool
 

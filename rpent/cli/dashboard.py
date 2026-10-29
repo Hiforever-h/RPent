@@ -37,7 +37,7 @@ from rpent.evaluation import RunFinalizationContext
 from rpent.memory import MemoryManager
 from rpent.planner.base import build_planner, is_recoverable_agent_error
 from rpent.robots import get_toolkit
-from rpent.session.capture import end_api_task, start_api_task
+from rpent.session.planner_capture import end_api_task, start_api_task
 from rpent.utils.config import get_memory_dir
 from rpent.utils.logging import get_logger, init_output_dir
 

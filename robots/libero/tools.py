@@ -31,7 +31,7 @@ from rpent.robots.components.molmo_client import MolmoClient
 from rpent.robots.components.pi05_vla_client import Pi05VLAClient
 from rpent.robots.components.sam3_client import Sam3Client
 from rpent.session import EnvState, MissingInfo, Payload, StepRecord
-from rpent.session.capture import CapturingEnvClient, current_tool_call
+from rpent.session.env_capture import CapturingEnvClient, current_tool_call
 from rpent.tools import Tool, ToolResult, tool
 from rpent.utils.logging import get_logger
 

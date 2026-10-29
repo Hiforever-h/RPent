@@ -27,7 +27,7 @@ from rpent.dashboard.events import NullDashboardEventSink
 from rpent.planner.api_loop import ApiAgentLoop
 from rpent.planner.base import PlannerResult
 from rpent.session import EnvState, Payload
-from rpent.session.capture import end_api_task, start_api_task
+from rpent.session.planner_capture import end_api_task, start_api_task
 
 
 @pytest.mark.parametrize("capture_enabled", [False, True])

@@ -38,7 +38,7 @@ from rpent.dashboard.events import NullDashboardEventSink
 from rpent.flywheel.reader import read_array
 from rpent.memory import MemoryManager
 from rpent.session import EnvState, Payload
-from rpent.session.capture import CapturingEnvClient, ToolCallCapture
+from rpent.session.env_capture import CapturingEnvClient, ToolCallCapture
 from rpent.tools import Tool, Toolkit, ToolResult, tool
 from rpent.tools.direct_action import direct_action_tool
 from rpent.utils import templates

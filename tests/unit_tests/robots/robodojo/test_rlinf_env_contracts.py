@@ -31,7 +31,7 @@ from rpent.dashboard.events import NullDashboardEventSink
 from rpent.flywheel.reader import read_array
 from rpent.memory import MemoryManager
 from rpent.session import Payload
-from rpent.session.capture import ToolCallCapture
+from rpent.session.env_capture import ToolCallCapture
 
 
 def test_server_arguments_reach_runtime_config():

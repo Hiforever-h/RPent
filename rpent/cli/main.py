@@ -62,7 +62,7 @@ from rpent.planner.base import (
 )
 from rpent.planner.check import BASE_URL_ENV_BY_PLANNER
 from rpent.robots import enumerate_robots, get_robot_spec, get_toolkit
-from rpent.session.capture import end_api_task, start_api_task
+from rpent.session.planner_capture import end_api_task, start_api_task
 from rpent.utils.logging import get_logger, init_output_dir
 
 logger = get_logger("agent")

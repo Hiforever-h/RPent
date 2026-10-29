@@ -27,7 +27,7 @@ from robots.robotwin.primitives import RoboTwinPrimitives
 from robots.robotwin.robot_spec import ROBOTWIN_CAMERA_NAMES
 from rpent.dashboard.events import DashboardEventSink
 from rpent.session import EnvState
-from rpent.session.capture import CapturingEnvClient
+from rpent.session.env_capture import CapturingEnvClient
 from rpent.tools import ToolResult, iter_tools, tool
 from rpent.tools.direct_action import direct_action_tool
 from rpent.tools.toolkit import Toolkit

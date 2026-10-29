@@ -22,7 +22,7 @@ from typing import Annotated, Any, Literal
 from pydantic import Field
 from pydantic.json_schema import SkipJsonSchema
 
-from rpent.session.capture import CapturingEnvClient
+from rpent.session.env_capture import CapturingEnvClient
 from rpent.tools import ToolResult, tool
 
 # (camera key in the obs dict, artifact base name). Mirrors the ``frame_channels``

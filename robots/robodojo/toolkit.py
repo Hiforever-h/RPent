@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 from rpent.dashboard.events import DashboardEventSink
 from rpent.session import EnvState
-from rpent.session.capture import CapturingEnvClient
+from rpent.session.env_capture import CapturingEnvClient
 from rpent.tools import Toolkit, ToolResult, iter_tools
 from rpent.utils.logging import get_output_dir
 

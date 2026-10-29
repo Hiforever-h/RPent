@@ -40,7 +40,7 @@ from rpent.prompt.utils import format_prompt
 from rpent.robots.components.action_spec import box_action_spec
 from rpent.robots.components.env_facade_base import BaseEnvFacade
 from rpent.session import EnvState, Payload
-from rpent.session.capture import CapturingEnvClient, ToolCallCapture
+from rpent.session.env_capture import CapturingEnvClient, ToolCallCapture
 from rpent.tools import Toolkit, ToolResult, iter_tools
 from rpent.tools.direct_action import direct_action_tool
 from rpent.utils.rpc import RpcError

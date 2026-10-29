@@ -29,7 +29,7 @@ from rpent.memory import MemoryManager
 from rpent.planner.api_loop import ApiAgentLoop
 from rpent.robots.components.action_spec import validate_action
 from rpent.session import EnvState, Payload
-from rpent.session.capture import CapturingEnvClient, ToolCallCapture
+from rpent.session.env_capture import CapturingEnvClient, ToolCallCapture
 from rpent.tools import ToolResult
 from rpent.tools.toolkit import ToolCancelled
 from rpent.utils.rpc import RpcError
@@ -737,7 +737,7 @@ def test_libero_client_facade_capture_and_raw_trajectory_roundtrip(
     from robots.libero.env_server import LiberoEnvFacade
     from rpent.flywheel.reader import read_array
     from rpent.session import EnvState
-    from rpent.session.capture import CapturingEnvClient, ToolCallCapture
+    from rpent.session.env_capture import CapturingEnvClient, ToolCallCapture
 
     backend = _LiberoBackend()
     state = EnvState(tmp_path)
@@ -823,7 +823,7 @@ def test_libero_failed_chunk_discards_unconfirmed_actions(
     from robots.libero.env_client import LiberoEnvClient
     from robots.libero.env_server import LiberoEnvFacade
     from rpent.session import EnvState
-    from rpent.session.capture import CapturingEnvClient, ToolCallCapture
+    from rpent.session.env_capture import CapturingEnvClient, ToolCallCapture
 
     state = EnvState(tmp_path)
     state.start_task(instruction="move", config=Payload("test.config", {}))

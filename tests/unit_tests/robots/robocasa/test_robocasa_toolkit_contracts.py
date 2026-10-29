@@ -29,7 +29,7 @@ from rpent.dashboard.events import NullDashboardEventSink
 from rpent.memory import MemoryManager
 from rpent.robots import RunConfig
 from rpent.session import Payload
-from rpent.session.capture import CapturingEnvClient, ToolCallCapture
+from rpent.session.env_capture import CapturingEnvClient, ToolCallCapture
 from rpent.tools import Toolkit, ToolResult
 from rpent.tools.common import CommonTools
 from rpent.utils import templates

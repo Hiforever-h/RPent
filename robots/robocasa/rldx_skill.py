@@ -31,7 +31,7 @@ import imageio.v2 as imageio
 import numpy as np
 
 from robots.robocasa.env_client import RoboCasaEnvClient
-from rpent.session.capture import CapturingEnvClient
+from rpent.session.env_capture import CapturingEnvClient
 from rpent.utils.logging import get_logger
 
 logger = get_logger("rldx_skill")

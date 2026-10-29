@@ -33,7 +33,7 @@ from pydantic import ValidationError
 
 from rpent.dashboard.events import DashboardEventSink, StepRecordEvent
 from rpent.session import Payload
-from rpent.session.capture import current_tool_call
+from rpent.session.env_capture import current_tool_call
 from rpent.tools.base import Tool, ToolResult, iter_tools
 from rpent.utils.logging import get_logger
 from rpent.utils.templates import substitute
