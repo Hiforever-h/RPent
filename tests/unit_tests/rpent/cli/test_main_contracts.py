@@ -706,6 +706,7 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
             "--explore-sessions",
             "3" if outcome == "response_truncated" else "2",
             *(["--tui"] if interactive else []),
+            *(["--record-trajectory"] if record_trajectory else []),
         ],
     )
 
