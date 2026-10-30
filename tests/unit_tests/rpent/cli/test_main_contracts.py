@@ -109,7 +109,7 @@ def test_public_cli_help_runs_from_source_checkout_without_a_robot_runtime() -> 
         "--output-dir",
         "--record-trajectory",
         "--dashboard",
-        "--interactive",
+        "--tui",
     ):
         assert option in result.stdout
 
@@ -184,6 +184,18 @@ def test_deprecated_env_alias_routes_to_the_same_robot(
     assert args.env_name == "robocasa"
 
 
+def test_tui_flag_reaches_args_and_interactive_alias_is_deprecated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, args = _capture_validated_args(monkeypatch, ["--robot", "libero", "--tui"])
+    assert args.tui is True
+
+    _, aliased = _capture_validated_args(
+        monkeypatch, ["--robot", "libero", "--interactive"]
+    )
+    assert aliased.tui is True
+
+
 def test_robot_and_env_aliases_are_mutually_exclusive(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -208,6 +220,10 @@ def test_robot_and_env_aliases_are_mutually_exclusive(
 @pytest.mark.parametrize(
     ("argv", "message"),
     [
+        (
+            ["--robot", "libero", "--dashboard", "--tui"],
+            "cannot be used together",
+        ),
         (
             ["--robot", "libero", "--dashboard", "--interactive"],
             "cannot be used together",
@@ -370,7 +386,7 @@ def test_handoff_uses_robot_capability_not_name(tmp_path, monkeypatch, real_robo
 
 
 @pytest.mark.parametrize(
-    "options,tty", [(["--interactive"], True), (["--dashboard"], True), ([], False)]
+    "options,tty", [(["--tui"], True), (["--dashboard"], True), ([], False)]
 )
 def test_real_robot_terminal_requirement_fails_before_runtime(
     monkeypatch, capsys, options, tty
@@ -689,8 +705,7 @@ def test_full_cli_exploration_finalizes_memory_without_starting_gpu_runtime(
             "4",
             "--explore-sessions",
             "3" if outcome == "response_truncated" else "2",
-            *(["--interactive"] if interactive else []),
-            *(["--record-trajectory"] if record_trajectory else []),
+            *(["--tui"] if interactive else []),
         ],
     )
 
