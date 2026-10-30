@@ -14,6 +14,7 @@
 
 from copy import deepcopy
 
+import numpy as np
 import pytest
 
 from rpent.flywheel.prepare import select_vla_segments
@@ -82,7 +83,8 @@ def test_robocasa_selection_uses_task_success_instead_of_done(
 
 
 @pytest.mark.parametrize(
-    "corruption", ["action", "binary", "state", "image", "image_kind", "image_path"]
+    "corruption",
+    ["action", "gripper", "control_mode", "state", "image", "image_kind", "image_path"],
 )
 def test_robocasa_selection_breaks_at_invalid_training_data(
     robocasa_trajectory, corruption
@@ -91,8 +93,8 @@ def test_robocasa_selection_breaks_at_invalid_training_data(
     fields = action["before_observation"]["payload"]["data"]
     if corruption == "action":
         action["action"]["data"]["value"][0] = float("nan")
-    elif corruption == "binary":
-        action["action"]["data"]["value"][6] = 0
+    elif corruption in ("gripper", "control_mode"):
+        action["action"]["data"]["value"][6 if corruption == "gripper" else 11] = 0
     elif corruption == "state":
         fields["robot0_base_to_eef_quat"]["shape"] = [3]
     elif corruption in ("image_kind", "image_path"):
@@ -146,8 +148,8 @@ def test_instruction_change_starts_a_new_segment(trajectory):
 
 def test_action_format_change_starts_a_new_segment(trajectory, monkeypatch):
     monkeypatch.setattr(
-        "robots.libero.flywheel.read_actions",
-        lambda root, payload: read_array(root, payload["data"]),
+        "rpent.flywheel.prepare.read_actions",
+        lambda root, payload, config: read_array(root, payload["data"]),
     )
     for action in trajectory["actions"][4:7]:
         action["action"]["format"] = "test.other_action"
@@ -190,14 +192,11 @@ def test_missing_required_action_data_excludes_the_step_and_breaks_continuity(
 
 def test_action_record_cannot_contain_an_entire_chunk(trajectory):
     payload = trajectory["actions"][2]["action"]
-    payload["format"] = "libero.action_chunk"
     payload["data"]["shape"] = [1, 7]
     payload["data"]["value"] = [payload["data"]["value"]]
     result = select_vla_segments(trajectory)
     assert _ranges(result) == [(1, 2), (3, 7)]
-    assert any(
-        "Expected one executed action" in row["reason"] for row in result["rejected"]
-    )
+    assert any("expected shape (7,)" in row["reason"] for row in result["rejected"])
 
 
 @pytest.mark.parametrize("index,expected", [(1, [(2, 7)]), (2, [(1, 2), (3, 7)])])
@@ -217,33 +216,6 @@ def test_final_after_observation_data_is_not_required_for_selection(trajectory, 
     result = select_vla_segments(trajectory)
 
     assert _ranges(result) == [(1, 36)]
-    assert result["rejected"] == []
-
-
-def test_legacy_executed_action_must_equal_its_prediction(legacy_trajectory):
-    trajectory = legacy_trajectory
-    trajectory["actions"][2]["action"]["data"]["value"][0] += 1
-    result = select_vla_segments(trajectory)
-    assert _ranges(result) == [(1, 2), (3, 7)]
-    assert any(
-        "differs from its prediction" in row["reason"] for row in result["rejected"]
-    )
-
-
-def test_legacy_prediction_action_count_must_match_references(legacy_trajectory):
-    prediction = legacy_trajectory["predictions"][0]
-    array = prediction["actions"]["data"]
-    array["value"].append(array["value"][-1])
-    array["shape"][0] += 1
-    result = select_vla_segments(legacy_trajectory)
-    assert _ranges(result) == [(4, 7)]
-    assert any("different lengths" in row["reason"] for row in result["rejected"])
-
-
-def test_legacy_predictions_still_select_executed_actions(legacy_trajectory):
-    result = select_vla_segments(legacy_trajectory)
-    assert legacy_trajectory["schema_version"] == 3
-    assert _ranges(result) == [(1, 7)]
     assert result["rejected"] == []
 
 
@@ -284,20 +256,6 @@ def test_invalid_prediction_does_not_supply_training_actions(trajectory, corrupt
         row.get("prediction_id") == prediction["prediction_id"]
         for row in result["rejected"]
     )
-
-
-def test_v4_prediction_observations_do_not_override_action_observations(trajectory):
-    trajectory["schema_version"] = 4
-    for prediction in trajectory["predictions"]:
-        prediction["input_observation_id"] = "O-old-prediction"
-        prediction["input_observation"] = deepcopy(
-            trajectory["actions"][0]["before_observation"]
-        )
-        prediction["missing"]["input_observation_id"] = {"reason": "capture_failed"}
-
-    result = select_vla_segments(trajectory)
-    assert _ranges(result) == [(1, 7)]
-    assert result["rejected"] == []
 
 
 def test_two_predictions_cannot_claim_the_same_executed_action(trajectory):
@@ -360,9 +318,16 @@ def test_duplicate_record_ids_fail_with_a_useful_error(trajectory, records, fiel
         select_vla_segments(trajectory)
 
 
-def test_robot_without_data_support_has_a_clear_error(trajectory):
-    trajectory["task"]["config"]["data"]["arguments"]["robot_name"] = "not_installed"
-    with pytest.raises(ValueError, match="not supported for not_installed"):
+@pytest.mark.parametrize(
+    "robot,message",
+    [
+        ("not_installed", "unknown robot: 'not_installed'"),
+        ("franka", "not supported for franka"),
+    ],
+)
+def test_robot_without_data_support_has_a_clear_error(trajectory, robot, message):
+    trajectory["task"]["config"]["data"]["arguments"]["robot_name"] = robot
+    with pytest.raises(ValueError, match=message):
         select_vla_segments(trajectory)
 
 
@@ -382,10 +347,71 @@ def test_bimanual_selection_requires_confirmed_task_success(
         assert selected["rejected"][0]["reason"] == "no_confirmed_environment_success"
 
 
-def test_bimanual_selection_requires_native_step_success(bimanual_trajectory):
+def test_bimanual_selection_stops_after_first_native_success(bimanual_trajectory):
     trajectory = bimanual_trajectory
-    trajectory["actions"][-1]["result"]["data"] = {}
+    result = trajectory["actions"][4]["result"]
+    field = "done" if result["format"] == "robodojo.step_result" else "terminated"
+    result["data"][field] = True
+    selected = select_vla_segments(trajectory)
+    assert _ranges(selected) == [(1, 5)]
+    assert [row["action_id"] for row in selected["rejected"]] == [
+        action["action_id"] for action in trajectory["actions"][5:7]
+    ]
+    assert all(
+        row["reason"] == "after_environment_success" for row in selected["rejected"]
+    )
+
+
+@pytest.mark.parametrize("bimanual_trajectory", ["robotwin"], indirect=True)
+def test_robotwin_truncation_before_success_excludes_the_trajectory(
+    bimanual_trajectory,
+):
+    bimanual_trajectory["actions"][3]["result"]["data"]["truncated"] = True
+    selected = select_vla_segments(bimanual_trajectory)
+    assert selected["segments"] == []
+    assert selected["rejected"][0]["reason"] == "no_confirmed_environment_success"
+
+
+@pytest.mark.parametrize(
+    "corruption", ["no_success", "format", "missing_root", "missing_field"]
+)
+def test_bimanual_selection_requires_native_step_success(
+    bimanual_trajectory, corruption
+):
+    trajectory = bimanual_trajectory
+    result = trajectory["actions"][-1]["result"]
+    if corruption == "no_success":
+        result["data"] = {}
+    elif corruption == "format":
+        result["format"] = "other.step_result"
+    else:
+        field = "done" if result["format"] == "robodojo.step_result" else "terminated"
+        result["missing"] = {
+            "" if corruption == "missing_root" else f"/{field}": {
+                "reason": "capture_failed"
+            }
+        }
     assert select_vla_segments(trajectory)["segments"] == []
+
+
+@pytest.mark.parametrize("bimanual_trajectory", ["robotwin"], indirect=True)
+@pytest.mark.parametrize("dtype", ["float32", "float64"])
+def test_robotwin_state_keeps_pose_dtype_for_grippers(bimanual_trajectory, dtype):
+    from robots.robotwin.robot_spec import FLYWHEEL_CONFIG
+    from rpent.flywheel.flywheel import validate_observation
+
+    trajectory = bimanual_trajectory
+    observation = trajectory["actions"][1]["before_observation"]
+    robot = observation["payload"]["data"]["robot_state"]
+    for side in ("left", "right"):
+        robot[f"{side}_eef_pose"]["dtype"] = dtype
+        robot[f"{side}_gripper"] = 0.123456789
+
+    state = validate_observation(trajectory["root"], observation, FLYWHEEL_CONFIG)
+    assert state.dtype == np.dtype(dtype)
+    np.testing.assert_array_equal(
+        state[[7, 15]], np.asarray([0.123456789, 0.123456789], dtype=dtype)
+    )
 
 
 @pytest.mark.parametrize(
@@ -395,6 +421,8 @@ def test_bimanual_selection_requires_native_step_success(bimanual_trajectory):
         "missing_action",
         "state_shape",
         "nonfinite",
+        "missing_state_parent",
+        "missing_image_parent",
         "missing_camera",
         "missing_image",
         "image_kind",
@@ -414,6 +442,18 @@ def test_bimanual_selection_breaks_at_invalid_required_data(
         )
     elif corruption == "missing_action":
         action["action"] = None
+    elif corruption in ("missing_state_parent", "missing_image_parent"):
+        if corruption == "missing_state_parent":
+            path = "/state" if robot == "robodojo" else "/robot_state"
+        else:
+            path = (
+                "/vision/cam_left_wrist"
+                if robot == "robodojo"
+                else "/observation/left_camera"
+            )
+        action["before_observation"]["payload"]["missing"] = {
+            path: {"reason": "capture_failed"}
+        }
     elif corruption in ("state_shape", "nonfinite"):
         state = (
             fields["state"]["left_arm_joint_state"]

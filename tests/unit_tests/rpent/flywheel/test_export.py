@@ -14,26 +14,41 @@
 
 import json
 import shutil
+import sys
+from dataclasses import replace
+from types import ModuleType
 
 import numpy as np
 import pytest
 
 from rpent.flywheel.export import export_dataset, load_dataset
+from rpent.robots import get_robot_spec
 
 pytest.importorskip("lerobot")
 
 
 @pytest.mark.parametrize("trajectory", [38], indirect=True)
-def test_robocasa_export_saves_rldx_videos_actions_and_metadata(
-    robocasa_trajectory, tmp_path
+@pytest.mark.parametrize("robot", ["robocasa", "test_robot"])
+def test_export_saves_declared_rldx_videos_actions_and_metadata(
+    robocasa_trajectory, tmp_path, monkeypatch, robot
 ):
     trajectory = robocasa_trajectory
+    if robot == "test_robot":
+        spec = replace(get_robot_spec("robocasa"), name=robot)
+        module = ModuleType(f"robots.{robot}")
+        module.get_robot_spec = lambda: spec
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    trajectory["task"]["config"]["data"]["arguments"]["robot_name"] = robot
+    document = json.loads((trajectory["root"] / "task.json").read_text())
+    document["task"] = trajectory["task"]
+    (trajectory["root"] / "task.json").write_text(json.dumps(document))
     trajectory["actions"][21]["source"] = "tool_computed"
     (trajectory["root"] / "actions.jsonl").write_text(
         "".join(json.dumps(row) + "\n" for row in trajectory["actions"])
     )
     output = tmp_path / "robocasa"
     report = export_dataset(trajectory["root"], output, horizon=16)
+    assert report["robot"] == robot
     assert report["frame_counts"] == {"train": 37, "validation": 0}
     assert report["episode_counts"] == {"train": 2, "validation": 0}
     assert report["window_counts"] == {"train": 7, "validation": 0}
@@ -42,6 +57,8 @@ def test_robocasa_export_saves_rldx_videos_actions_and_metadata(
     moved = output.rename(tmp_path / "moved")
     shutil.rmtree(trajectory["root"])
     dataset = load_dataset(moved, "train")
+    assert dataset.features["observation.state"]["dtype"] == "float64"
+    assert dataset.features["action"]["dtype"] == "float64"
     indices = np.r_[1:21, 22:39]
     actions = np.arange(12)[None, :] / 100 + indices[:, None] / 20
     actions[:, 6] = ((-1.0) ** indices + 1) / 2
@@ -110,6 +127,9 @@ def test_bimanual_export_preserves_native_state_actions_and_camera_order(
     assert dataset.features["action"]["shape"] == (dim,)
     assert dataset.features["action"]["dtype"] == "float64"
     assert dataset.features["observation.state"]["shape"] == (dim,)
+    assert dataset.features["observation.state"]["dtype"] == (
+        "float32" if robot == "robodojo" else "float64"
+    )
     stored = dataset.hf_dataset.with_format(None)
     for index, frame in enumerate(dataset, 1):
         expected_action = np.arange(dim) / 10 + index
@@ -240,8 +260,8 @@ def test_export_stores_all_trajectories_as_individual_training_frames(
     shutil.rmtree(jobs)
     dataset = load_dataset(moved, "train")
     assert len(dataset) == dataset.meta.total_frames == 105
-    assert dataset.features["actions"]["shape"] == (7,)
-    assert dataset.features["actions"]["dtype"] == dtype
+    assert dataset.features["action"]["shape"] == (7,)
+    assert dataset.features["action"]["dtype"] == dtype
     assert len(load_dataset(moved, "validation")) == 0
     for offset in range(105):
         sample = dataset[offset]
@@ -250,11 +270,11 @@ def test_export_stores_all_trajectories_as_individual_training_frames(
             np.arange(start * 7, (start + 1) * 7, dtype=np.float32) / 100,
             dtype=dtype,
         )
-        np.testing.assert_array_equal(sample["actions"], expected)
+        np.testing.assert_array_equal(sample["action"], expected)
         np.testing.assert_array_equal(
-            sample["state"], np.full(8, start, dtype=np.float32)
+            sample["observation.state"], np.full(8, start, dtype=np.float32)
         )
-        assert "actions_is_pad" not in sample
+        assert "action_is_pad" not in sample
         assert sample["image"].shape == sample["wrist_image"].shape == (3, 256, 256)
         assert sample["prompt"] == sample["task"] == "pick up the bowl"
         assert sample["episode_index"].item() == offset // 35
@@ -289,7 +309,7 @@ def test_export_keeps_short_segments_and_loader_does_not_bridge_a_script(
         for episode in source["episodes"]
     ] == [(1, 8), (9, 36)]
     dataset = load_dataset(output, "train")
-    assert [sample["state"][0].item() for sample in dataset] == [
+    assert [sample["observation.state"][0].item() for sample in dataset] == [
         *range(1, 8),
         *range(9, 36),
     ]
@@ -299,21 +319,21 @@ def test_export_keeps_short_segments_and_loader_does_not_bridge_a_script(
         report["repo_id"],
         root=output / "train",
         video_backend="pyav",
-        delta_timestamps={"actions": [step / report["fps"] for step in range(10)]},
+        delta_timestamps={"action": [step / report["fps"] for step in range(10)]},
     )
     last_short = windows[6]
-    assert last_short["actions"].shape == (10, 7)
-    assert last_short["actions_is_pad"].tolist() == [False] + [True] * 9
+    assert last_short["action"].shape == (10, 7)
+    assert last_short["action_is_pad"].tolist() == [False] + [True] * 9
     np.testing.assert_array_equal(
-        last_short["actions"],
-        np.repeat(dataset[6]["actions"].numpy()[None, :], 10, axis=0),
+        last_short["action"],
+        np.repeat(dataset[6]["action"].numpy()[None, :], 10, axis=0),
     )
-    assert not windows[7]["actions_is_pad"].any()
+    assert not windows[7]["action_is_pad"].any()
     np.testing.assert_array_equal(
-        windows[7]["actions"],
-        np.stack([dataset[index]["actions"] for index in range(7, 17)]),
+        windows[7]["action"],
+        np.stack([dataset[index]["action"] for index in range(7, 17)]),
     )
-    assert sum(not sample["actions_is_pad"].any() for sample in windows) == 18
+    assert sum(not sample["action_is_pad"].any() for sample in windows) == 18
 
 
 @pytest.mark.parametrize(
@@ -332,7 +352,7 @@ def test_export_preserves_every_step_including_short_tails(
     assert report["trajectories"][0]["excluded_action_count"] == 2
     dataset = load_dataset(output, "train")
     assert len(dataset) == expected_steps
-    assert [frame["state"][0].item() for frame in dataset] == list(
+    assert [frame["observation.state"][0].item() for frame in dataset] == list(
         range(1, expected_steps + 1)
     )
 
@@ -346,7 +366,7 @@ def test_horizon_only_changes_window_statistics(trajectory, tmp_path):
         assert report["frame_counts"] == {"train": 6, "validation": 0}
         assert report["window_counts"] == {"train": count, "validation": 0}
         outputs.append(
-            np.stack([frame["actions"] for frame in load_dataset(output, "train")])
+            np.stack([frame["action"] for frame in load_dataset(output, "train")])
         )
     np.testing.assert_array_equal(outputs[0], outputs[1])
 
@@ -382,12 +402,12 @@ def test_loader_windows_stay_inside_selected_segments(
         report["repo_id"],
         root=output / "train",
         video_backend="pyav",
-        delta_timestamps={"actions": [step / report["fps"] for step in range(10)]},
+        delta_timestamps={"action": [step / report["fps"] for step in range(10)]},
     )
     assert [
-        frame["state"][0].item()
+        frame["observation.state"][0].item()
         for frame in windows
-        if not frame["actions_is_pad"].any()
+        if not frame["action_is_pad"].any()
     ] == starts
 
 
@@ -407,18 +427,8 @@ def test_export_merges_continuous_actions_across_tool_calls(trajectory, tmp_path
     assert report["frame_counts"] == {"train": 20, "validation": 0}
     assert report["window_counts"] == {"train": 11, "validation": 0}
     assert [
-        frame["state"][0].item() for frame in load_dataset(output, "train")
+        frame["observation.state"][0].item() for frame in load_dataset(output, "train")
     ] == list(range(1, 21))
-
-
-def test_export_reads_legacy_actions_as_individual_frames(legacy_trajectory, tmp_path):
-    output = tmp_path / "legacy"
-    report = export_dataset(legacy_trajectory["root"], output)
-    assert report["frame_counts"] == {"train": 6, "validation": 0}
-    np.testing.assert_array_equal(
-        np.stack([frame["actions"] for frame in load_dataset(output, "train")]),
-        np.arange(7, 49, dtype=np.float32).reshape(6, 7) / 100,
-    )
 
 
 @pytest.mark.parametrize("horizon", [0, -1, True, 1.5])

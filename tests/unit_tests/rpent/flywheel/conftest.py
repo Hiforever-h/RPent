@@ -18,7 +18,7 @@ from copy import deepcopy
 import numpy as np
 import pytest
 
-from rpent.flywheel.reader import iter_trajectories, read_array
+from rpent.flywheel.reader import iter_trajectories
 from rpent.session import EnvState, MissingInfo, Payload
 
 
@@ -109,40 +109,6 @@ def trajectory(tmp_path, request):
         result=Payload("libero.result", {"environment_success": True}),
     )
     root = state.save_planner_trajectory()
-    return next(iter_trajectories(root))
-
-
-@pytest.fixture
-def legacy_trajectory(trajectory):
-    root = trajectory["root"]
-    actions = {row["action_id"]: row for row in trajectory["actions"]}
-    for prediction in trajectory["predictions"]:
-        first = actions[prediction["action_ids"][0]]
-        prediction["input_observation_id"] = first["before_observation_id"]
-        prediction["input_observation"] = first["before_observation"]
-        values = np.stack(
-            [
-                read_array(root, actions[action_id]["action"]["data"])
-                for action_id in prediction["action_ids"]
-            ]
-        )
-        prediction["actions"] = {
-            "format": "libero.action_chunk",
-            "completeness": "complete",
-            "data": {
-                "$type": "ndarray",
-                "dtype": str(values.dtype),
-                "shape": list(values.shape),
-                "value": values.tolist(),
-            },
-        }
-    task_path = root / "task.json"
-    task = json.loads(task_path.read_text())
-    task["schema_version"] = 3
-    task_path.write_text(json.dumps(task))
-    (root / "predictions.jsonl").write_text(
-        "".join(json.dumps(row) + "\n" for row in trajectory["predictions"])
-    )
     return next(iter_trajectories(root))
 
 
@@ -256,15 +222,15 @@ def bimanual_trajectory(trajectory, request):
 
 @pytest.fixture
 def robocasa_trajectory(trajectory):
-    from robots.robocasa.flywheel import IMAGE_FIELDS, STATE_FIELDS
-
     root = trajectory["root"]
     trajectory["task"]["config"]["data"]["arguments"]["robot_name"] = "robocasa"
 
     observations = {}
     for index in range(len(trajectory["actions"]) + 1):
         images = {}
-        for camera_index, camera in enumerate(IMAGE_FIELDS.values()):
+        for camera_index, camera in enumerate(
+            ("robot0_agentview_left", "robot0_agentview_right", "robot0_eye_in_hand")
+        ):
             image = np.full((64, 64, 3), index * 4, dtype=np.uint8)
             image[..., camera_index] = 180
             image[:16, :16] = [220, 40, 80]
@@ -280,7 +246,13 @@ def robocasa_trajectory(trajectory):
         values = np.arange(16, dtype=np.float64) + index * 100
         fields = {"images": images}
         start = 0
-        for name, size in STATE_FIELDS.values():
+        for name, size in (
+            ("robot0_base_to_eef_pos", 3),
+            ("robot0_base_to_eef_quat", 4),
+            ("robot0_gripper_qpos", 2),
+            ("robot0_base_pos", 3),
+            ("robot0_base_quat", 4),
+        ):
             fields[name] = _array(values[start : start + size])
             start += size
         observation_id = f"O{index + 1}"

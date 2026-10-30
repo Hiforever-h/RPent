@@ -194,9 +194,7 @@ def test_invalid_jsonl_reports_filename_and_physical_line(tmp_path, filename, ba
     [
         "{\ninvalid",
         "[]",
-        '{"schema_version": 2, "task": {}}',
-        '{"schema_version": 6, "task": {}}',
-        '{"schema_version": 3}',
+        '{"schema_version": 5}',
     ],
 )
 def test_invalid_task_reports_source_file(tmp_path, contents):
@@ -205,6 +203,20 @@ def test_invalid_task_reports_source_file(tmp_path, contents):
     with pytest.raises(ValueError) as error:
         list(iter_trajectories(root))
     assert str(root.resolve() / "task.json") in str(error.value)
+
+
+@pytest.mark.parametrize("version", [2, 3, 4, 6])
+def test_unsupported_trajectory_schema_reports_source_file(tmp_path, version):
+    root = _save_trajectory(tmp_path)
+    path = root / "task.json"
+    document = json.loads(path.read_text())
+    document["schema_version"] = version
+    path.write_text(json.dumps(document))
+    with pytest.raises(
+        ValueError, match="expected trajectory schema_version 5"
+    ) as error:
+        list(iter_trajectories(root))
+    assert str(path.resolve()) in str(error.value)
 
 
 @pytest.mark.parametrize("filename", ["actions.jsonl", "predictions.jsonl"])

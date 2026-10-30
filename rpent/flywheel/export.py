@@ -18,13 +18,16 @@ from __future__ import annotations
 
 import json
 import shutil
-from importlib import import_module
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any, Literal
 
+import numpy as np
+
+from rpent.flywheel.flywheel import read_frame
 from rpent.flywheel.prepare import select_vla_segments
 from rpent.flywheel.reader import iter_trajectories
+from rpent.robots import get_robot_spec
 
 if TYPE_CHECKING:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -87,16 +90,19 @@ def export_dataset(
                 robot = task["config"]["data"]["arguments"]["robot_name"]
                 if report["robot"] is not None and robot != report["robot"]:
                     raise ValueError("Export each robot into a separate dataset")
-                flywheel = import_module(f"robots.{robot}.flywheel")
-                image_fields = set(flywheel.IMAGE_FIELDS)
-                use_videos = getattr(flywheel, "USE_VIDEOS", False)
+                config = get_robot_spec(robot).flywheel
+                image_fields = set(config["images"])
+                use_videos = config.get("use_videos", False)
             for segment in selected["segments"]:
                 records = trajectory["actions"][
                     segment["start_index"] : segment["stop_index"]
                 ]
                 for record in records:
-                    frame = flywheel.read_frame(
-                        trajectory["root"], record, segment["instruction"]
+                    frame = read_frame(
+                        trajectory["root"],
+                        record,
+                        segment["instruction"],
+                        config,
                     )
                     if dataset is None:
                         features = {
@@ -121,13 +127,13 @@ def export_dataset(
                             repo_id=repo_id,
                             root=root / "train",
                             robot_type=robot,
-                            fps=flywheel.DATASET_FPS,
+                            fps=config["fps"],
                             features=features,
                             use_videos=use_videos,
                             video_backend="pyav",
                         )
                         report["dataset_paths"]["train"] = "train"
-                        report.update(robot=robot, fps=flywheel.DATASET_FPS)
+                        report.update(robot=robot, fps=config["fps"])
                     dataset.add_frame(frame, task=segment["instruction"])
                 dataset.save_episode()
                 frame_count = len(records)
@@ -163,9 +169,8 @@ def export_dataset(
             source["exported_action_count"] > 0 for source in report["trajectories"]
         )
         if dataset is not None:
-            write_metadata = getattr(flywheel, "write_metadata", None)
-            if write_metadata is not None:
-                write_metadata(dataset)
+            if config.get("metadata") == "rldx":
+                _write_rldx_metadata(dataset, config)
             # Images are embedded in Parquet or encoded as videos.
             shutil.rmtree(root / "train" / "images")
         (root / "report.json").write_text(
@@ -173,6 +178,41 @@ def export_dataset(
         )
         root.rename(destination)
     return {"output_dir": str(destination), **report}
+
+
+def _write_rldx_metadata(dataset: LeRobotDataset, config: dict[str, Any]) -> None:
+    """Save RLDX field groups and statistics, including quantiles."""
+    from lerobot.datasets.utils import serialize_dict, write_json
+
+    modality = {
+        "video": {
+            field["path"][-1]: {"original_key": name}
+            for name, field in config["images"].items()
+        },
+        "annotation": {"human.task_description": {"original_key": "task_index"}},
+    }
+    groups = {
+        "state": {
+            field["name"]: field["shape"][0] for field in config["state"]["fields"]
+        },
+        "action": config["action"]["groups"],
+    }
+    for kind, fields in groups.items():
+        modality[kind] = {}
+        start = 0
+        for name, size in fields.items():
+            modality[kind][name] = {"start": start, "end": start + size}
+            start += size
+    statistics = {}
+    stored = dataset.hf_dataset.with_format("numpy")
+    for name in ("observation.state", "action"):
+        statistics[name] = {
+            key: dataset.meta.stats[name][key] for key in ("min", "max", "mean", "std")
+        }
+        q01, q99 = np.quantile(stored[name], (0.01, 0.99), axis=0)
+        statistics[name].update(q01=q01, q99=q99)
+    write_json(modality, dataset.root / "meta" / "modality.json")
+    write_json(serialize_dict(statistics), dataset.root / "meta" / "stats.json")
 
 
 def load_dataset(

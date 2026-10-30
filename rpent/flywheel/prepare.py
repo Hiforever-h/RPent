@@ -14,10 +14,14 @@
 
 """Select continuous ranges of executed VLA actions."""
 
-from importlib import import_module
 from typing import Any
 
-import numpy as np
+from rpent.flywheel.flywheel import (
+    read_actions,
+    successful_prefix,
+    validate_observation,
+)
+from rpent.robots import get_robot_spec
 
 
 def select_vla_segments(trajectory: dict[str, Any]) -> dict[str, list[dict]]:
@@ -26,15 +30,9 @@ def select_vla_segments(trajectory: dict[str, Any]) -> dict[str, list[dict]]:
     robot = task["config"]["data"]["arguments"].get("robot_name")
     if not isinstance(robot, str) or not robot.isidentifier():
         raise ValueError("Task config must identify a robot_name")
-    module_name = f"robots.{robot}.flywheel"
-    try:
-        flywheel = import_module(module_name)
-    except ModuleNotFoundError as exc:
-        if exc.name in (f"robots.{robot}", module_name):
-            raise ValueError(
-                f"Trajectory data selection is not supported for {robot}"
-            ) from exc
-        raise
+    config = get_robot_spec(robot).flywheel
+    if config is None:
+        raise ValueError(f"Trajectory data selection is not supported for {robot}")
 
     actions = trajectory["actions"]
     result = task.get("result") or {}
@@ -42,13 +40,7 @@ def select_vla_segments(trajectory: dict[str, Any]) -> dict[str, list[dict]]:
     if (result.get("data") or {}).get("environment_success") is True and not any(
         key in result.get("missing", {}) for key in ("", "/environment_success")
     ):
-        # Without a per-step success marker, keep the whole successful trajectory.
-        successful_prefix = getattr(flywheel, "successful_prefix", None)
-        stop = (
-            successful_prefix(actions)
-            if successful_prefix is not None
-            else len(actions)
-        )
+        stop = successful_prefix(actions, config)
     segments = []
     rejected = []
     if not stop:
@@ -103,18 +95,9 @@ def select_vla_segments(trajectory: dict[str, Any]) -> dict[str, list[dict]]:
                 raise ValueError("Missing local instruction or tool call")
             if any(
                 key in prediction.get("missing", {})
-                for key in ("actions", "action_ids", "instruction")
+                for key in ("action_ids", "instruction")
             ):
                 raise ValueError("Missing prediction data")
-            values = None
-            if trajectory["schema_version"] == 3:
-                values = flywheel.read_actions(
-                    trajectory["root"], prediction["actions"]
-                )
-                if values.ndim != 2 or len(values) != len(action_ids):
-                    raise ValueError(
-                        "Prediction actions and action_ids have different lengths"
-                    )
             known_positions = [
                 positions[item] for item in action_ids if item in positions
             ]
@@ -125,7 +108,7 @@ def select_vla_segments(trajectory: dict[str, Any]) -> dict[str, list[dict]]:
                 {"prediction_id": prediction_id, "reason": f"invalid_prediction: {exc}"}
             )
             continue
-        for offset, action_id in enumerate(action_ids):
+        for action_id in action_ids:
             if action_id not in positions:
                 rejected.append(
                     {
@@ -135,9 +118,7 @@ def select_vla_segments(trajectory: dict[str, Any]) -> dict[str, list[dict]]:
                     }
                 )
                 continue
-            references.setdefault(action_id, []).append(
-                (prediction, None if values is None else values[offset])
-            )
+            references.setdefault(action_id, []).append(prediction)
 
     segment = previous = None
     for index, action in enumerate(actions):
@@ -152,7 +133,7 @@ def select_vla_segments(trajectory: dict[str, Any]) -> dict[str, list[dict]]:
         elif len(claims) > 1:
             reason = "multiple_predictions_claim_action"
         else:
-            prediction, predicted = claims[0]
+            prediction = claims[0]
             try:
                 if action.get("source") != "vla":
                     raise ValueError("Prediction references a non-VLA action")
@@ -179,12 +160,8 @@ def select_vla_segments(trajectory: dict[str, Any]) -> dict[str, list[dict]]:
                     ):
                         raise ValueError(f"Missing or inconsistent {side} observation")
                     if side == "before":
-                        flywheel.validate_observation(trajectory["root"], observation)
-                actual = flywheel.read_actions(trajectory["root"], action["action"])
-                if actual.ndim != 1:
-                    raise ValueError("Expected one executed action")
-                if predicted is not None and not np.array_equal(actual, predicted):
-                    raise ValueError("Executed action differs from its prediction")
+                        validate_observation(trajectory["root"], observation, config)
+                read_actions(trajectory["root"], action["action"], config)
             except (KeyError, TypeError, ValueError, OSError) as exc:
                 reason = f"invalid_action: {exc}"
 
@@ -195,7 +172,7 @@ def select_vla_segments(trajectory: dict[str, Any]) -> dict[str, list[dict]]:
                     "action_id": action_id,
                     "reason": reason,
                 }
-                for prediction, _ in claims
+                for prediction in claims
             )
             segment = previous = None
             continue

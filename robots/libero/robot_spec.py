@@ -108,6 +108,25 @@ LIBERO_DASHBOARD_SPEC: DashboardSpec = {
 }
 
 
+FLYWHEEL_CONFIG = {
+    "observation_format": "libero.observation",
+    "state": {
+        "fields": ({"path": ("states",), "shape": (8,)},),
+    },
+    "action": {
+        "format": "libero.action",
+        "fields": ({"path": (), "shape": (7,)},),
+    },
+    "images": {
+        "image": {"path": ("main_images",), "shape": (256, 256, 3)},
+        "wrist_image": {"path": ("wrist_images",), "shape": (256, 256, 3)},
+    },
+    "result_format": "libero.step_result",
+    "success": {"field": "terminated", "truncated": "truncated"},
+    "fps": 20,
+}
+
+
 def _run_flash(toolkit, cell_tag: str, note) -> dict:
     """Run a recorded Flash plan for one cell. Imported late: it loads numpy."""
     from robots.libero.flash import run_flash
@@ -133,6 +152,7 @@ def get_robot_spec() -> RobotSpec:
         parse_config=_parse_config,
         init_runtime=_init_runtime,
         dashboard=LIBERO_DASHBOARD_SPEC,
+        flywheel=FLYWHEEL_CONFIG,
         supports_exploration=True,
         run_flash=_run_flash,
         validate_args=validate_options,
