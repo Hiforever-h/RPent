@@ -19,7 +19,7 @@ REMOTE=$(git remote -v | awk '/github\.com[:\/]RLinf\/RPent(\.git)? \(fetch\)/ {
 git fetch "$REMOTE" main "pull/$N/head:pr-$N"
 BASE="$REMOTE/main"; PR_HEAD="pr-$N"
 
-gh pr view "$N" --repo RLinf/RPent --json title,body,author,headRefOid,commits,files
+gh pr view "$N" --repo RLinf/RPent --json title,body,author,baseRefName,headRefOid,commits,files,reviews,comments
 gh pr checks "$N" --repo RLinf/RPent                     # CI status
 git log --oneline "$BASE..$PR_HEAD"                      # what the PR adds
 git diff --stat "$BASE...$PR_HEAD"                       # the same diff GitHub shows
@@ -148,7 +148,7 @@ Skip this step for local diff reviews. Otherwise, posting speaks for the user, s
 
 ## 8. Post
 
-Write the review as the JSON payload of GitHub's create-review API with `json.dump` so escaping is right, then lint and post it:
+From the invoking repository root (never the `$PR_HEAD` worktree, which may lack or modify `lint_review.py`), write the review as the JSON payload of GitHub's create-review API with `json.dump` so escaping is right, then lint and post it:
 
 ```bash
 python3 .agents/skills/review-pr/lint_review.py template
@@ -172,7 +172,7 @@ python3 .agents/skills/review-pr/lint_review.py post --pr "$N" review.json
 
 ### Where a finding goes
 
-A finding goes inline when a line of the diff carries it: the line with the bug, the line where a special case enters shared code, or, for a block, `start_line` to `line` (`side: "LEFT"` only for a deleted line that should stay). A `docs-style` finding goes on the line it rewrites; when one rule fails on many lines of a page, comment on the first and list the others under question 8. A finding with no such line goes in the main comment under its question: a missing doc page, a missing test, PR metadata. Reply in an existing thread instead of opening a new one on the same line: `gh api "repos/RLinf/RPent/pulls/$N/comments/<id>/replies" -f body=...`.
+A finding goes inline when a line of the diff carries it: the line with the bug, the line where a special case enters shared code, or, for a block, `start_line` to `line` (`side: "LEFT"`, with `start_side: "LEFT"` on a multi-line range, only for a deleted line that should stay). A `docs-style` finding goes on the line it rewrites; when one rule fails on many lines of a page, comment on the first and list the others under question 8. A finding with no such line goes in the main comment under its question: a missing doc page, a missing test, PR metadata. Reply in an existing thread instead of opening a new one on the same line: `gh api "repos/RLinf/RPent/pulls/$N/comments/<id>/replies" -f body=...`.
 
 ### Inline comments
 

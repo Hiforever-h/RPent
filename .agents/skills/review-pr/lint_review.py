@@ -254,17 +254,35 @@ class ReviewLinter:
                 "payload",
                 f"event must be one of {EVENTS}, found {self.payload['event']!r}",
             )
-        commit_id = self.payload.get("commit_id")
-        if self.pr and commit_id not in (None, self.pr.head_sha):
-            self.error(
-                "payload",
-                f"commit_id {str(commit_id)[:7]} is not the PR head "
-                f"{self.pr.head_sha[:7]}; re-check the findings on the new head",
-            )
-        self.check_body(self.payload.get("body") or "")
-        seen: set[tuple[str, str, int]] = set()
-        for i, comment in enumerate(self.payload.get("comments") or [], 1):
-            self.check_comment(i, comment, seen)
+        if "commit_id" in self.payload:
+            commit_id = self.payload["commit_id"]
+            if not isinstance(commit_id, str) or not re.fullmatch(
+                r"[0-9a-f]{40}", commit_id
+            ):
+                self.error(
+                    "payload",
+                    f"commit_id must be a 40-character hex SHA, found {commit_id!r}",
+                )
+            elif self.pr and commit_id != self.pr.head_sha:
+                self.error(
+                    "payload",
+                    f"commit_id {commit_id[:7]} is not the PR head "
+                    f"{self.pr.head_sha[:7]}; re-check the findings on the new head",
+                )
+        body = self.payload.get("body")
+        if not isinstance(body, str):
+            self.error("payload", f"body must be a string, found {type(body).__name__}")
+        else:
+            self.check_body(body)
+        comments = self.payload.get("comments", [])
+        if not isinstance(comments, list) or not all(
+            isinstance(c, dict) for c in comments
+        ):
+            self.error("payload", "comments must be a list of comment objects")
+        else:
+            seen: set[tuple[str, str, int]] = set()
+            for i, comment in enumerate(comments, 1):
+                self.check_comment(i, comment, seen)
         return self.findings
 
     def check_prose(self, where: str, text: str) -> None:
@@ -315,8 +333,17 @@ class ReviewLinter:
         for n, heading, lines in sections:
             if not "\n".join(lines).strip():
                 self.error("body", f"section at line {n} ({heading}) is empty")
-        last = sections[-1][2] if sections and sections[-1][1] == expected[-1] else []
-        picked = [r for r in RECOMMENDATIONS if r.lower() in "\n".join(last).lower()]
+        last = "\n".join(
+            sections[-1][2] if sections and sections[-1][1] == expected[-1] else []
+        )
+        picked = [
+            r
+            for r in RECOMMENDATIONS
+            if re.search(
+                rf"(?m)(?:^\s*(?:[-*+]\s+)?(?:Recommendation:\s*)?[`*]*|[`*]+){re.escape(r)}\b",
+                last,
+            )
+        ]
         if not picked:
             self.error(
                 "body",
@@ -342,9 +369,13 @@ class ReviewLinter:
                 where, "needs a string path, an integer line, and a non-empty body"
             )
             return
-        if side not in ("RIGHT", "LEFT") or c.get("start_side", side) != side:
+        start_side = c.get(
+            "start_side", "RIGHT" if c.get("start_line") is not None else side
+        )
+        if side not in ("RIGHT", "LEFT") or start_side != side:
             self.error(
-                where, f"side and start_side must both be RIGHT or LEFT, found {side!r}"
+                where,
+                f"side and start_side must match and be RIGHT or LEFT, found side={side!r}, start_side={start_side!r}",
             )
         start = c.get("start_line")
         if start is not None and (not isinstance(start, int) or start >= line):
@@ -402,7 +433,8 @@ class ReviewLinter:
 def report(findings: list[Finding], payload: dict, checked_lines: bool) -> int:
     errors = [f for f in findings if f.level == "ERROR"]
     warns = [f for f in findings if f.level == "WARN"]
-    n = len(payload.get("comments") or [])
+    raw_comments = payload.get("comments")
+    n = len(raw_comments) if isinstance(raw_comments, list) else 0
     print(f"review: {payload.get('event', 'COMMENT')}, body + {n} inline comment(s)")
     print(f"{len(errors)} error(s), {len(warns)} warning(s)")
     for f in errors + warns:
